@@ -32,5 +32,5 @@ uv pip install -q -r requirements.txt
 echo "Warming ml-sharp (first run downloads weights & PyTorch)..."
 uvx --from=git+https://github.com/apple/ml-sharp sharp --help >/dev/null 2>&1 || true
 
-echo "Open http://127.0.0.1:8000"
+echo "Open http://0.0.0.0:8000"
 exec python server.py

@@ -23,8 +23,42 @@
       font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
       overflow: hidden;
     }
-    #viewer { position: fixed; inset: 0; z-index: 0; background: #000; }
+    #viewer { position: fixed; inset: 0; z-index: 0; background: #000; overflow: hidden; }
     #viewer canvas { display: block; }
+    .view-host { position: absolute; inset: 0; display: none; }
+    .view-host.active { display: block; }
+    #slice-host {
+      align-items: center;
+      justify-content: center;
+      perspective: 1400px;
+      background:
+        radial-gradient(circle at 50% 25%, rgba(88, 110, 168, 0.18), transparent 34%),
+        radial-gradient(circle at 50% 50%, rgba(255,255,255,0.06), transparent 55%),
+        #050507;
+    }
+    #slice-host.active { display: flex; }
+    #slice-stage {
+      position: relative;
+      transform-style: preserve-3d;
+      will-change: transform;
+    }
+    #slice-stack {
+      position: relative;
+      overflow: hidden;
+      border-radius: 24px;
+      background: #070709;
+      box-shadow: 0 36px 120px rgba(0,0,0,0.62);
+      transform-style: preserve-3d;
+    }
+    .slice-layer {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      will-change: transform;
+      transform-origin: center center;
+      image-rendering: auto;
+    }
 
     .panel {
       position: fixed;
@@ -37,12 +71,12 @@
       border: 1px solid var(--line);
       border-radius: 14px;
       padding: 14px 16px;
-      width: 320px;
+      width: 348px;
       box-shadow: 0 20px 50px rgba(0,0,0,0.45);
     }
     .panel h1 { font-size: 14px; margin: 0 0 8px; font-weight: 600; letter-spacing: .2px; }
     .panel p.sub { font-size: 12px; color: var(--muted); margin: 0 0 14px; line-height: 1.45; }
-    .row { display: flex; gap: 8px; align-items: center; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .btn {
       appearance: none; border: 0; cursor: pointer;
       background: var(--accent); color: white; font-weight: 600;
@@ -67,38 +101,131 @@
     }
     .meta { font-size: 11px; color: var(--muted); line-height: 1.5; }
     .meta b { color: var(--fg); font-weight: 500; }
+    .section-label {
+      display: block;
+      margin: 12px 0 6px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .panel-note {
+      margin: 12px 0 0;
+      font-size: 11px;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+    .mini-meta {
+      min-height: 16px;
+      font-size: 11px;
+      color: var(--muted);
+      line-height: 1.4;
+    }
 
     .controls {
       position: fixed; right: 18px; bottom: 18px; z-index: 10;
       display: flex; flex-direction: column; align-items: flex-end; gap: 12px;
     }
-    .joystick {
-      width: 140px; height: 140px; border-radius: 50%;
-      background: radial-gradient(circle at 30% 30%, rgba(255,255,255,0.08), rgba(0,0,0,0.45));
+    .device-pad {
+      width: 172px;
+      height: 196px;
+      border-radius: 28px;
+      background:
+        radial-gradient(circle at 50% 20%, rgba(255,255,255,0.10), transparent 42%),
+        linear-gradient(180deg, rgba(255,255,255,0.04), rgba(0,0,0,0.28));
       border: 1px solid var(--line);
       backdrop-filter: blur(18px);
-      position: relative; touch-action: none;
+      position: relative;
+      touch-action: none;
       cursor: grab;
+      display: grid;
+      place-items: center;
+      perspective: 1100px;
+      box-shadow: 0 20px 50px rgba(0,0,0,0.30);
     }
-    .joystick.dragging { cursor: grabbing; }
-    .joystick::before {
-      content: ""; position: absolute; inset: 50% 8% auto 8%; height: 1px;
-      background: rgba(255,255,255,0.06);
+    .device-pad.dragging { cursor: grabbing; }
+    .device-pad::before {
+      content: "";
+      position: absolute;
+      inset: 18px;
+      border-radius: 22px;
+      border: 1px dashed rgba(255,255,255,0.08);
     }
-    .joystick::after {
-      content: ""; position: absolute; left: 50%; top: 8%; bottom: 8%; width: 1px;
-      background: rgba(255,255,255,0.06);
-    }
-    .knob {
-      position: absolute; left: 50%; top: 50%;
-      width: 46px; height: 46px; margin: -23px 0 0 -23px;
-      border-radius: 50%;
-      background: linear-gradient(180deg, #f4f5fa 0%, #b6b9c8 100%);
-      box-shadow: 0 6px 14px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.6);
-      transition: transform .25s cubic-bezier(.2,.7,.2,1.2);
+    .device-model {
+      position: relative;
+      width: 108px;
+      height: 168px;
+      border-radius: 24px;
+      background: linear-gradient(180deg, #4b5569 0%, #20242d 52%, #111318 100%);
+      box-shadow:
+        0 20px 35px rgba(0,0,0,0.48),
+        inset 0 1px 0 rgba(255,255,255,0.24),
+        inset 0 -1px 0 rgba(255,255,255,0.04);
+      transform-style: preserve-3d;
       will-change: transform;
+      transition: transform .25s cubic-bezier(.2,.7,.2,1.2);
     }
-    .joystick.dragging .knob { transition: none; }
+    .device-pad.dragging .device-model { transition: none; }
+    .device-model::before {
+      content: "";
+      position: absolute;
+      inset: 7px;
+      border-radius: 18px;
+      background:
+        radial-gradient(circle at 28% 18%, rgba(255,255,255,0.12), transparent 20%),
+        linear-gradient(180deg, rgba(255,255,255,0.04), rgba(0,0,0,0.22));
+      border: 1px solid rgba(255,255,255,0.08);
+      transform: translateZ(2px);
+    }
+    .device-screen {
+      position: absolute;
+      inset: 12px 10px;
+      border-radius: 16px;
+      background:
+        radial-gradient(circle at 30% 18%, rgba(133, 170, 255, 0.42), transparent 28%),
+        linear-gradient(160deg, #141824 0%, #0d1119 46%, #0f1622 100%);
+      overflow: hidden;
+      transform: translateZ(8px);
+    }
+    .device-screen::before {
+      content: "";
+      position: absolute;
+      inset: 16px 18px auto 18px;
+      height: 8px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.10);
+    }
+    .device-screen::after {
+      content: "";
+      position: absolute;
+      inset: auto 18px 18px 18px;
+      height: 54px;
+      border-radius: 14px;
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.10), rgba(255,255,255,0.02)),
+        rgba(255,255,255,0.04);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.10);
+    }
+    .device-glow {
+      position: absolute;
+      inset: 22px 16px 42px;
+      border-radius: 18px;
+      background:
+        radial-gradient(circle at 50% 25%, rgba(100, 172, 255, 0.66), transparent 32%),
+        radial-gradient(circle at 50% 70%, rgba(140, 255, 221, 0.16), transparent 42%);
+      filter: blur(1px);
+      transform: translateZ(12px);
+      opacity: .85;
+    }
+    .device-meta {
+      position: absolute;
+      left: 12px;
+      right: 12px;
+      bottom: 10px;
+      font-size: 10px;
+      color: rgba(255,255,255,0.68);
+      text-align: center;
+      letter-spacing: .04em;
+      pointer-events: none;
+    }
     .hint {
       font-size: 11px; color: var(--muted); padding: 6px 10px;
       background: var(--panel); border: 1px solid var(--line);
@@ -121,11 +248,18 @@
   </style>
 </head>
 <body>
-  <div id="viewer"></div>
+  <div id="viewer">
+    <div id="slice-host" class="view-host active">
+      <div id="slice-stage">
+        <div id="slice-stack"></div>
+      </div>
+    </div>
+    <div id="splat-host" class="view-host"></div>
+  </div>
 
   <div class="panel">
     <h1>ml-sharp · spatial wallpaper</h1>
-    <p class="sub">Upload a photo. Apple's <b>SHARP</b> turns it into a 3D Gaussian splat. Drag the ball to tilt the view, like an iOS 26 spatial wallpaper anchored on the original perspective.</p>
+    <p class="sub">Upload a photo. The page keeps the original Gaussian splat preview, and also simulates an <b>LVGL / MCU</b> target by cutting the image into depth slices with padded edges and parallax motion.</p>
 
     <div class="row">
       <label class="btn" for="file">Choose image</label>
@@ -135,10 +269,22 @@
 
     <div id="status" class="status">Idle.</div>
 
+    <span class="section-label">Preview mode</span>
+    <div class="axis-flip">
+      <span class="pill active" data-mode="mcu">MCU slices</span>
+      <span class="pill" data-mode="splat">Gaussian splat</span>
+    </div>
+
+    <span class="section-label">Motion input</span>
+    <div id="motion-meta" class="mini-meta">Drag the device model to simulate gyro pitch and roll.</div>
+
     <div class="thumb-row">
       <div id="thumb" class="thumb" title="Source image"></div>
       <div class="meta" id="meta"></div>
     </div>
+
+    <div class="meta" id="slice-meta"></div>
+    <p class="panel-note">MCU mode projects the SHARP PLY back into a 2D depth map, cuts it into 8-12 layers, expands edges to approximate inpainting, then shifts the layers from a virtual device pose.</p>
   </div>
 
   <div class="controls">
@@ -147,7 +293,9 @@
       <input id="tilt" type="range" min="2" max="30" value="12" />
       <label>Parallax <span id="par-val">0.10</span></label>
       <input id="par" type="range" min="0" max="40" value="10" />
-      <label>Splat orientation</label>
+      <label>MCU slices <span id="slice-count-val">10</span></label>
+      <input id="slice-count" type="range" min="8" max="12" value="10" />
+      <label>Splat orientation debug</label>
       <div class="axis-flip">
         <span class="pill active" data-flip="default">default</span>
         <span class="pill" data-flip="flipY">flip Y</span>
@@ -155,8 +303,15 @@
         <span class="pill" data-flip="flipYZ">flip Y+Z</span>
       </div>
     </div>
-    <div class="hint">Drag the ball to tilt · release to recenter</div>
-    <div class="joystick" id="joystick"><div class="knob" id="knob"></div></div>
+    <div class="hint">Drag the device to simulate gyro · release to spring back toward center</div>
+    <div class="device-pad" id="device-pad">
+      <div class="device-model" id="device-model">
+        <div class="device-screen">
+          <div class="device-glow"></div>
+        </div>
+      </div>
+      <div class="device-meta" id="device-meta">roll 0.0° · pitch 0.0°</div>
+    </div>
   </div>
 
   <script type="importmap">
@@ -174,28 +329,48 @@
     import * as GS3D from '@mkkellogg/gaussian-splats-3d';
 
     const $ = (id) => document.getElementById(id);
+    const viewerEl = $('viewer');
+    const splatHost = $('splat-host');
+    const sliceHost = $('slice-host');
+    const sliceStage = $('slice-stage');
+    const sliceStack = $('slice-stack');
     const statusEl = $('status');
     const fileEl = $('file');
     const thumbEl = $('thumb');
     const metaEl = $('meta');
+    const sliceMetaEl = $('slice-meta');
     const resetEl = $('reset');
-    const joystick = $('joystick');
-    const knob = $('knob');
+    const motionMetaEl = $('motion-meta');
+    const devicePad = $('device-pad');
+    const deviceModel = $('device-model');
+    const deviceMetaEl = $('device-meta');
     const tiltSlider = $('tilt');
     const parSlider = $('par');
+    const sliceCountSlider = $('slice-count');
     const tiltVal = $('tilt-val');
     const parVal = $('par-val');
+    const sliceCountVal = $('slice-count-val');
 
     let viewer = null;
     let currentSplatUrl = null;
+    let currentSourceUrl = null;
+    let currentSourceObjectUrl = null;
     let baseMetaHtml = '';
+    let currentViewMode = 'mcu';
+    let currentSliceBase = null;
+    let currentSlicePreview = null;
+    let sliceBuildToken = 0;
 
     // Drag state, normalized to [-1, 1]
     const drag = { x: 0, y: 0, active: false, target: { x: 0, y: 0 } };
-
     // Camera anchor — set once a splat is loaded.
     const SHARP_FORWARD = new THREE.Vector3(0, 0, 1);
     const SHARP_WORLD_UP = new THREE.Vector3(0, -1, 0);
+    const MCU_PREVIEW_MAX_EDGE = 1920;
+    const MCU_PREVIEW_TARGET_PIXELS = 1920 * 1080;
+    const DEPTH_FILL_PASSES = 6;
+    const PLY_HEADER_SCAN_BYTES = 65536;
+    const PLY_ROW_BYTES = 14 * 4;
 
     const anchor = {
       position: new THREE.Vector3(0, 0, 0),
@@ -211,6 +386,50 @@
     function setStatus(msg, isErr = false) {
       statusEl.textContent = msg;
       statusEl.classList.toggle('err', isErr);
+    }
+
+    function setSliceMeta(msg = '') {
+      sliceMetaEl.innerHTML = msg;
+    }
+
+    function nextFrame() {
+      return new Promise((resolve) => requestAnimationFrame(resolve));
+    }
+
+    function clamp(v, lo, hi) {
+      return Math.min(hi, Math.max(lo, v));
+    }
+
+    function fitSize(srcW, srcH, maxW, maxH = maxW, maxPixels = Infinity) {
+      const edgeScale = Math.min(maxW / srcW, maxH / srcH, 1);
+      const pixelScale = Number.isFinite(maxPixels)
+        ? Math.min(1, Math.sqrt(maxPixels / Math.max(1, srcW * srcH)))
+        : 1;
+      const scale = Math.min(edgeScale, pixelScale);
+      return {
+        width: Math.max(1, Math.round(srcW * scale)),
+        height: Math.max(1, Math.round(srcH * scale)),
+      };
+    }
+
+    function setViewMode(mode) {
+      currentViewMode = mode;
+      sliceHost.classList.toggle('active', mode === 'mcu');
+      splatHost.classList.toggle('active', mode === 'splat');
+      document.querySelectorAll('.pill[data-mode]').forEach((pill) => {
+        pill.classList.toggle('active', pill.dataset.mode === mode);
+      });
+      if (mode === 'splat' && !viewer) {
+        setStatus('Gaussian splat is still loading in the background…');
+      }
+      if (mode === 'mcu') layoutSliceStage();
+    }
+
+    function getCombinedTilt() {
+      return {
+        x: clamp(drag.x, -1, 1),
+        y: clamp(drag.y, -1, 1),
+      };
     }
 
     function flipMatrix(name) {
@@ -236,17 +455,16 @@
         viewer.setRenderMode && viewer.setRenderMode(GS3D.RenderMode.Never);
         await viewer.dispose();
       } catch (e) { console.warn('dispose:', e); }
-      const host = $('viewer');
-      while (host.firstChild) host.removeChild(host.firstChild);
+      while (splatHost.firstChild) splatHost.removeChild(splatHost.firstChild);
       viewer = null;
     }
 
-    async function loadSplat(url) {
+    async function loadSplat(url, { announce = true } = {}) {
       await destroyViewer();
       currentSplatUrl = url;
 
       viewer = new GS3D.Viewer({
-        rootElement: $('viewer'),
+        rootElement: splatHost,
         cameraUp: [0, -1, 0],
         initialCameraPosition: [0, 0, 0.0001],
         initialCameraLookAt: [0, 0, 1],
@@ -275,7 +493,9 @@
       // Retry a few frames because the splat mesh bounds are not always ready
       // on the first RAF after addSplatScene() resolves.
       scheduleSceneFit();
-      setStatus(`Loaded splat (${(viewer?.splatMesh?.getSplatCount?.() ?? '?')} gaussians)`);
+      if (announce) {
+        setStatus(`Loaded splat (${(viewer?.splatMesh?.getSplatCount?.() ?? '?')} gaussians)`);
+      }
     }
 
     function scheduleSceneFit(attempt = 0) {
@@ -323,24 +543,506 @@
       }
     }
 
+    function parseSharpPlyHeader(buffer) {
+      const headerText = new TextDecoder().decode(buffer.slice(0, PLY_HEADER_SCAN_BYTES));
+      const endIndex = headerText.indexOf('end_header');
+      if (endIndex < 0) throw new Error('PLY header missing end_header');
+      const lineEnd = headerText.indexOf('\n', endIndex);
+      if (lineEnd < 0) throw new Error('PLY header missing newline after end_header');
+      const header = headerText.slice(0, lineEnd + 1);
+      let vertexCount = 0;
+      for (const line of header.split(/\r?\n/)) {
+        if (line.startsWith('element vertex ')) {
+          vertexCount = parseInt(line.split(/\s+/).at(-1), 10);
+          break;
+        }
+      }
+      if (!vertexCount) throw new Error('PLY vertex count not found');
+
+      const view = new DataView(buffer);
+      let offset = lineEnd + 1 + vertexCount * PLY_ROW_BYTES;
+      offset += 16 * 4; // extrinsic
+
+      const intrinsic = new Float32Array(9);
+      for (let i = 0; i < 9; i++) intrinsic[i] = view.getFloat32(offset + i * 4, true);
+      offset += 9 * 4;
+
+      const imageWidth = view.getUint32(offset, true);
+      const imageHeight = view.getUint32(offset + 4, true);
+
+      return {
+        vertexCount,
+        dataOffset: lineEnd + 1,
+        intrinsic,
+        imageWidth,
+        imageHeight,
+      };
+    }
+
+    function clearSliceStack() {
+      while (sliceStack.firstChild) sliceStack.removeChild(sliceStack.firstChild);
+    }
+
+    function ensureSliceToken(token) {
+      if (token !== sliceBuildToken) throw new Error('slice build superseded');
+    }
+
+    async function loadImage(src) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.decoding = 'async';
+        img.onload = () => resolve(img);
+        img.onerror = () => reject(new Error(`image load failed: ${src}`));
+        img.src = src;
+      });
+    }
+
+    async function prepareSliceBase(sourceUrl, plyUrl, token) {
+      if (
+        currentSliceBase &&
+        currentSliceBase.sourceUrl === sourceUrl &&
+        currentSliceBase.plyUrl === plyUrl
+      ) {
+        return currentSliceBase;
+      }
+
+      const [img, plyBuffer] = await Promise.all([
+        loadImage(sourceUrl),
+        fetch(plyUrl).then((r) => {
+          if (!r.ok) throw new Error(`PLY fetch failed (${r.status})`);
+          return r.arrayBuffer();
+        }),
+      ]);
+      ensureSliceToken(token);
+
+      const ply = parseSharpPlyHeader(plyBuffer);
+      const previewSize = fitSize(
+        img.naturalWidth,
+        img.naturalHeight,
+        MCU_PREVIEW_MAX_EDGE,
+        MCU_PREVIEW_MAX_EDGE,
+        MCU_PREVIEW_TARGET_PIXELS,
+      );
+
+      const sourceCanvas = document.createElement('canvas');
+      sourceCanvas.width = previewSize.width;
+      sourceCanvas.height = previewSize.height;
+      const sourceCtx = sourceCanvas.getContext('2d', { willReadFrequently: true });
+      sourceCtx.drawImage(img, 0, 0, previewSize.width, previewSize.height);
+      const sourceImageData = sourceCtx.getImageData(0, 0, previewSize.width, previewSize.height);
+
+      setStatus('Projecting SHARP PLY into a 2D depth map…');
+      const projection = await projectDepthMapFromPly(
+        plyBuffer,
+        ply,
+        previewSize.width,
+        previewSize.height,
+        token,
+      );
+      ensureSliceToken(token);
+
+      setStatus('Filling depth holes for MCU slice extraction…');
+      const depthFill = await fillDepthHoles(
+        projection.depth,
+        previewSize.width,
+        previewSize.height,
+        token,
+      );
+      ensureSliceToken(token);
+
+      currentSliceBase = {
+        sourceUrl,
+        plyUrl,
+        previewWidth: previewSize.width,
+        previewHeight: previewSize.height,
+        sourceRgba: sourceImageData.data,
+        depth: depthFill.depth,
+        projectedCoverage: projection.coverage,
+        sampleStep: projection.sampleStep,
+        depthMin: depthFill.minDepth,
+        depthMax: depthFill.maxDepth,
+        imageWidth: ply.imageWidth,
+        imageHeight: ply.imageHeight,
+        vertexCount: ply.vertexCount,
+      };
+      return currentSliceBase;
+    }
+
+    async function projectDepthMapFromPly(buffer, ply, targetW, targetH, token) {
+      const depth = new Float32Array(targetW * targetH);
+      depth.fill(Number.POSITIVE_INFINITY);
+
+      const view = new DataView(buffer);
+      const [fx, , cx, , fy, cy] = ply.intrinsic;
+      const scaleX = targetW / ply.imageWidth;
+      const scaleY = targetH / ply.imageHeight;
+      const targetPixels = targetW * targetH;
+      const desiredSamples = targetPixels * 0.8;
+      const sampleStep = Math.max(1, Math.floor(ply.vertexCount / desiredSamples));
+      const stampRadius = sampleStep >= 5 ? 1 : 0;
+      const chunkSize = 30000 * sampleStep;
+      let filled = 0;
+
+      for (let i = 0; i < ply.vertexCount; i += sampleStep) {
+        const offset = ply.dataOffset + i * PLY_ROW_BYTES;
+        const z = view.getFloat32(offset + 8, true);
+        if (!(z > 1e-5) || !Number.isFinite(z)) {
+          if (i && i % chunkSize === 0) {
+            setStatus(`Projecting SHARP depth… ${Math.round((i / ply.vertexCount) * 100)}%`);
+            await nextFrame();
+            ensureSliceToken(token);
+          }
+          continue;
+        }
+
+        const x = view.getFloat32(offset, true);
+        const y = view.getFloat32(offset + 4, true);
+        const u = (fx * x) / z + cx;
+        const v = (fy * y) / z + cy;
+        const px = Math.round(u * scaleX);
+        const py = Math.round(v * scaleY);
+        if (px >= 0 && px < targetW && py >= 0 && py < targetH) {
+          for (let oy = -stampRadius; oy <= stampRadius; oy++) {
+            const sy = py + oy;
+            if (sy < 0 || sy >= targetH) continue;
+            for (let ox = -stampRadius; ox <= stampRadius; ox++) {
+              const sx = px + ox;
+              if (sx < 0 || sx >= targetW) continue;
+              const idx = sy * targetW + sx;
+              if (z < depth[idx]) {
+                if (!Number.isFinite(depth[idx])) filled++;
+                depth[idx] = z;
+              }
+            }
+          }
+        }
+
+        if (i && i % chunkSize === 0) {
+          setStatus(`Projecting SHARP depth… ${Math.round((i / ply.vertexCount) * 100)}%`);
+          await nextFrame();
+          ensureSliceToken(token);
+        }
+      }
+
+      return {
+        depth,
+        sampleStep,
+        coverage: filled / depth.length,
+      };
+    }
+
+    async function fillDepthHoles(depth, width, height, token) {
+      let src = depth;
+      let dst = new Float32Array(depth.length);
+
+      for (let pass = 0; pass < DEPTH_FILL_PASSES; pass++) {
+        let changed = 0;
+        for (let y = 0; y < height; y++) {
+          for (let x = 0; x < width; x++) {
+            const idx = y * width + x;
+            if (Number.isFinite(src[idx])) {
+              dst[idx] = src[idx];
+              continue;
+            }
+
+            let sum = 0;
+            let count = 0;
+            for (let oy = -1; oy <= 1; oy++) {
+              const sy = y + oy;
+              if (sy < 0 || sy >= height) continue;
+              for (let ox = -1; ox <= 1; ox++) {
+                if (!ox && !oy) continue;
+                const sx = x + ox;
+                if (sx < 0 || sx >= width) continue;
+                const value = src[sy * width + sx];
+                if (Number.isFinite(value)) {
+                  sum += value;
+                  count++;
+                }
+              }
+            }
+
+            if (count) {
+              dst[idx] = sum / count;
+              changed++;
+            } else {
+              dst[idx] = Number.POSITIVE_INFINITY;
+            }
+          }
+        }
+
+        [src, dst] = [dst, src];
+        if (!changed) break;
+
+        setStatus(`Filling depth holes… pass ${pass + 1}/${DEPTH_FILL_PASSES}`);
+        await nextFrame();
+        ensureSliceToken(token);
+      }
+
+      let minDepth = Number.POSITIVE_INFINITY;
+      let maxDepth = 0;
+      for (let i = 0; i < src.length; i++) {
+        const value = src[i];
+        if (!Number.isFinite(value)) continue;
+        if (value < minDepth) minDepth = value;
+        if (value > maxDepth) maxDepth = value;
+      }
+
+      if (!Number.isFinite(minDepth) || !Number.isFinite(maxDepth)) {
+        throw new Error('Depth projection produced no valid samples');
+      }
+
+      for (let i = 0; i < src.length; i++) {
+        if (!Number.isFinite(src[i])) src[i] = maxDepth;
+      }
+
+      return { depth: src, minDepth, maxDepth };
+    }
+
+    function computeDepthBoundaries(depth, layerCount) {
+      const samples = [];
+      const stride = Math.max(1, Math.floor(depth.length / 220000));
+      for (let i = 0; i < depth.length; i += stride) {
+        const value = depth[i];
+        if (Number.isFinite(value)) samples.push(value);
+      }
+      samples.sort((a, b) => a - b);
+      const boundaries = new Float32Array(layerCount + 1);
+      boundaries[0] = samples[0];
+      for (let i = 1; i < layerCount; i++) {
+        const index = Math.min(samples.length - 1, Math.floor((samples.length - 1) * (i / layerCount)));
+        boundaries[i] = samples[index];
+      }
+      boundaries[layerCount] = samples[samples.length - 1] + 1e-5;
+      for (let i = 1; i < boundaries.length; i++) {
+        if (boundaries[i] <= boundaries[i - 1]) boundaries[i] = boundaries[i - 1] + 1e-5;
+      }
+      return boundaries;
+    }
+
+    function depthBandForValue(value, boundaries) {
+      for (let i = 0; i < boundaries.length - 1; i++) {
+        if (value <= boundaries[i + 1]) return i;
+      }
+      return boundaries.length - 2;
+    }
+
+    function expandLayerEdges(rgba, width, height, passes) {
+      let src = rgba;
+      let dst = new Uint8ClampedArray(rgba.length);
+      const rowStride = width * 4;
+
+      for (let pass = 0; pass < passes; pass++) {
+        let changed = false;
+        dst.set(src);
+        for (let y = 1; y < height - 1; y++) {
+          for (let x = 1; x < width - 1; x++) {
+            const idx = (y * width + x) * 4;
+            if (src[idx + 3]) continue;
+            const neighbors = [
+              idx - 4,
+              idx + 4,
+              idx - rowStride,
+              idx + rowStride,
+              idx - rowStride - 4,
+              idx - rowStride + 4,
+              idx + rowStride - 4,
+              idx + rowStride + 4,
+            ];
+            let copied = false;
+            for (const n of neighbors) {
+              if (!src[n + 3]) continue;
+              dst[idx] = src[n];
+              dst[idx + 1] = src[n + 1];
+              dst[idx + 2] = src[n + 2];
+              dst[idx + 3] = src[n + 3];
+              copied = true;
+              changed = true;
+              break;
+            }
+            if (!copied) dst[idx + 3] = 0;
+          }
+        }
+        [src, dst] = [dst, src];
+        if (!changed) break;
+      }
+
+      if (src !== rgba) rgba.set(src);
+    }
+
+    async function renderSlicePreview(base, layerCount, token) {
+      const totalPixels = base.previewWidth * base.previewHeight;
+      const boundaries = computeDepthBoundaries(base.depth, layerCount);
+      const bandMap = new Uint8Array(totalPixels);
+      const bandPixels = new Uint32Array(layerCount);
+
+      for (let i = 0; i < totalPixels; i++) {
+        const band = depthBandForValue(base.depth[i], boundaries);
+        bandMap[i] = band;
+        bandPixels[band]++;
+      }
+
+      clearSliceStack();
+      const layers = [];
+      const source = base.sourceRgba;
+      const denom = Math.max(1, layerCount - 1);
+
+      const backdropCanvas = document.createElement('canvas');
+      backdropCanvas.width = base.previewWidth;
+      backdropCanvas.height = base.previewHeight;
+      backdropCanvas.className = 'slice-layer';
+      const backdropCtx = backdropCanvas.getContext('2d');
+      backdropCtx.putImageData(new ImageData(new Uint8ClampedArray(source), base.previewWidth, base.previewHeight), 0, 0);
+      sliceStack.appendChild(backdropCanvas);
+      layers.push({
+        canvas: backdropCanvas,
+        nearWeight: 0,
+        pixels: totalPixels,
+        isBackdrop: true,
+      });
+
+      for (let band = layerCount - 1; band >= 0; band--) {
+        setStatus(`Compositing MCU slices… layer ${layerCount - band}/${layerCount}`);
+        await nextFrame();
+        ensureSliceToken(token);
+
+        const rgba = new Uint8ClampedArray(totalPixels * 4);
+        for (let i = 0; i < totalPixels; i++) {
+          if (bandMap[i] !== band) continue;
+          const srcIdx = i * 4;
+          rgba[srcIdx] = source[srcIdx];
+          rgba[srcIdx + 1] = source[srcIdx + 1];
+          rgba[srcIdx + 2] = source[srcIdx + 2];
+          rgba[srcIdx + 3] = source[srcIdx + 3];
+        }
+
+        const nearWeight = 1 - band / denom;
+        const expansionPasses = 1 + Math.round((1 - nearWeight) * 2);
+        expandLayerEdges(rgba, base.previewWidth, base.previewHeight, expansionPasses);
+
+        const canvas = document.createElement('canvas');
+        canvas.width = base.previewWidth;
+        canvas.height = base.previewHeight;
+        canvas.className = 'slice-layer';
+        const ctx = canvas.getContext('2d');
+        ctx.putImageData(new ImageData(rgba, base.previewWidth, base.previewHeight), 0, 0);
+        sliceStack.appendChild(canvas);
+        layers.push({
+          canvas,
+          nearWeight,
+          band,
+          pixels: bandPixels[band],
+          isBackdrop: false,
+        });
+      }
+
+      currentSlicePreview = {
+        base,
+        layers,
+        layerCount,
+        boundaries,
+        displayWidth: 0,
+        displayHeight: 0,
+      };
+
+      setSliceMeta(
+        `<b>MCU preview:</b> ${layerCount} slices + backdrop · ${base.previewWidth}×${base.previewHeight} preview · `
+        + `${Math.round(base.projectedCoverage * 100)}% raw depth coverage · sample 1/${base.sampleStep}`,
+      );
+      layoutSliceStage();
+      return currentSlicePreview;
+    }
+
+    function layoutSliceStage() {
+      if (!currentSlicePreview) return;
+      const fit = fitSize(
+        currentSlicePreview.base.previewWidth,
+        currentSlicePreview.base.previewHeight,
+        Math.max(1, window.innerWidth - 48),
+        Math.max(1, window.innerHeight - 48),
+      );
+      currentSlicePreview.displayWidth = fit.width;
+      currentSlicePreview.displayHeight = fit.height;
+      sliceStage.style.width = `${fit.width}px`;
+      sliceStage.style.height = `${fit.height}px`;
+      sliceStack.style.width = `${fit.width}px`;
+      sliceStack.style.height = `${fit.height}px`;
+    }
+
+    async function buildSlicePreview({ forceBase = false } = {}) {
+      if (!currentSourceUrl || !currentSplatUrl) return;
+      const token = ++sliceBuildToken;
+
+      try {
+        if (forceBase) currentSliceBase = null;
+        const base = await prepareSliceBase(currentSourceUrl, currentSplatUrl, token);
+        ensureSliceToken(token);
+        const layerCount = parseInt(sliceCountSlider.value, 10);
+        await renderSlicePreview(base, layerCount, token);
+        ensureSliceToken(token);
+        setViewMode('mcu');
+        setStatus(`MCU preview ready · ${layerCount} depth slices`);
+      } catch (e) {
+        if (e.message === 'slice build superseded') return;
+        console.error(e);
+        setStatus(`Slice preview error: ${e.message}`, true);
+      }
+    }
+
+    function updateSliceTransforms(nx, ny) {
+      if (!currentSlicePreview) return;
+      const tiltRange = parseFloat(tiltSlider.value);
+      const parallax = parseFloat(parSlider.value) / 100;
+      const travel = Math.min(currentSlicePreview.displayWidth, currentSlicePreview.displayHeight) * (0.010 + parallax * 0.140);
+
+      sliceStage.style.transform = `rotateX(${(-ny * tiltRange * 0.20).toFixed(2)}deg) rotateY(${(nx * tiltRange * 0.26).toFixed(2)}deg)`;
+      for (const layer of currentSlicePreview.layers) {
+        const weight = layer.isBackdrop
+          ? 0.05
+          : 0.08 + Math.pow(layer.nearWeight, 1.55) * 0.32;
+        const tx = (-nx * travel * weight).toFixed(2);
+        const ty = (ny * travel * weight).toFixed(2);
+        const tz = (layer.isBackdrop ? 0 : layer.nearWeight * 18).toFixed(2);
+        const scale = (
+          (layer.isBackdrop ? 1.018 : 1.022 + layer.nearWeight * 0.026)
+          + Math.abs(nx) * 0.006
+          + Math.abs(ny) * 0.006
+        ).toFixed(4);
+        layer.canvas.style.transform = `translate3d(${tx}px, ${ty}px, ${tz}px) scale(${scale})`;
+      }
+    }
+
+    function updateDeviceModel(nx, ny) {
+      const rollDeg = nx * 22;
+      const pitchDeg = -ny * 22;
+      const floatX = nx * 10;
+      const floatY = ny * 8;
+      deviceModel.style.transform =
+        `translate3d(${floatX.toFixed(1)}px, ${floatY.toFixed(1)}px, 0) `
+        + `rotateX(${pitchDeg.toFixed(1)}deg) rotateY(${rollDeg.toFixed(1)}deg) rotateZ(${(nx * 7).toFixed(1)}deg)`;
+      deviceMetaEl.textContent = `roll ${rollDeg.toFixed(1)}° · pitch ${pitchDeg.toFixed(1)}°`;
+      motionMetaEl.textContent = `Virtual gyro · roll ${rollDeg.toFixed(1)}° · pitch ${pitchDeg.toFixed(1)}°`;
+    }
+
     // ------- Camera animation loop, decoupled from viewer's RAF -------
     function tick() {
       // Smoothly chase target with spring-back when not dragging.
       const stiffness = drag.active ? 0.35 : 0.18;
       drag.x += (drag.target.x - drag.x) * stiffness;
       drag.y += (drag.target.y - drag.y) * stiffness;
+      const combined = getCombinedTilt();
 
       if (viewer && viewer.camera) {
         const maxAngle = THREE.MathUtils.degToRad(parseFloat(tiltSlider.value));
         const parallax = parseFloat(parSlider.value) / 100;
 
-        const yaw = -drag.x * maxAngle;
-        const pitch = -drag.y * maxAngle;
+        const yaw = -combined.x * maxAngle;
+        const pitch = -combined.y * maxAngle;
 
         // Build offset position around the fitted anchor in anchor-local axes.
         const offset = new THREE.Vector3()
-          .addScaledVector(anchor.right, drag.x * parallax)
-          .addScaledVector(anchor.up, -drag.y * parallax);
+          .addScaledVector(anchor.right, combined.x * parallax)
+          .addScaledVector(anchor.up, -combined.y * parallax);
 
         const cam = viewer.camera;
         cam.position.copy(anchor.position).add(offset);
@@ -356,79 +1058,91 @@
         cam.lookAt(target);
         cam.updateMatrixWorld(true);
       }
+
+      updateSliceTransforms(combined.x, combined.y);
+      updateDeviceModel(combined.x, combined.y);
       requestAnimationFrame(tick);
     }
     tick();
 
-    // ------- Drag ball -------
-    const RADIUS = 47; // max knob travel from center, px
-    function setKnob(nx, ny) {
-      const px = nx * RADIUS;
-      const py = ny * RADIUS;
-      knob.style.transform = `translate(${px}px, ${py}px)`;
-    }
+    // ------- Virtual device drag -------
+    const DEVICE_RADIUS = 54; // max device drag from center, px
     function clampDisk(x, y) {
       const r = Math.hypot(x, y);
       if (r <= 1) return [x, y];
       return [x / r, y / r];
     }
     function pointerToNorm(ev) {
-      const rect = joystick.getBoundingClientRect();
+      const rect = devicePad.getBoundingClientRect();
       const cx = rect.left + rect.width / 2;
       const cy = rect.top + rect.height / 2;
-      const x = (ev.clientX - cx) / RADIUS;
-      const y = (ev.clientY - cy) / RADIUS;
+      const x = (ev.clientX - cx) / DEVICE_RADIUS;
+      const y = (ev.clientY - cy) / DEVICE_RADIUS;
       return clampDisk(x, y);
     }
-    joystick.addEventListener('pointerdown', (ev) => {
+    devicePad.addEventListener('pointerdown', (ev) => {
       drag.active = true;
-      joystick.classList.add('dragging');
-      joystick.setPointerCapture(ev.pointerId);
+      devicePad.classList.add('dragging');
+      devicePad.setPointerCapture(ev.pointerId);
       const [x, y] = pointerToNorm(ev);
       drag.target.x = x; drag.target.y = y;
-      setKnob(x, y);
     });
-    joystick.addEventListener('pointermove', (ev) => {
+    devicePad.addEventListener('pointermove', (ev) => {
       if (!drag.active) return;
       const [x, y] = pointerToNorm(ev);
       drag.target.x = x; drag.target.y = y;
-      setKnob(x, y);
     });
     const release = (ev) => {
       if (!drag.active) return;
       drag.active = false;
-      joystick.classList.remove('dragging');
-      try { joystick.releasePointerCapture(ev.pointerId); } catch {}
+      devicePad.classList.remove('dragging');
+      try { devicePad.releasePointerCapture(ev.pointerId); } catch {}
       drag.target.x = 0; drag.target.y = 0;
-      setKnob(0, 0);
     };
-    joystick.addEventListener('pointerup', release);
-    joystick.addEventListener('pointercancel', release);
+    devicePad.addEventListener('pointerup', release);
+    devicePad.addEventListener('pointercancel', release);
 
     // ------- Sliders + axis flip -------
     tiltSlider.addEventListener('input', () => tiltVal.textContent = `${tiltSlider.value}°`);
     parSlider.addEventListener('input', () => parVal.textContent = (parSlider.value / 100).toFixed(2));
+    sliceCountSlider.addEventListener('input', () => sliceCountVal.textContent = sliceCountSlider.value);
+    sliceCountSlider.addEventListener('change', () => {
+      if (currentSourceUrl && currentSplatUrl) buildSlicePreview();
+    });
     document.querySelectorAll('.pill[data-flip]').forEach((el) => {
       el.addEventListener('click', () => {
         document.querySelectorAll('.pill[data-flip]').forEach(p => p.classList.remove('active'));
         el.classList.add('active');
         orientation = el.dataset.flip;
-        if (currentSplatUrl) loadSplat(currentSplatUrl);
+        if (currentSplatUrl) loadSplat(currentSplatUrl, { announce: false });
       });
+    });
+    document.querySelectorAll('.pill[data-mode]').forEach((el) => {
+      el.addEventListener('click', () => setViewMode(el.dataset.mode));
     });
 
     resetEl.addEventListener('click', () => {
       drag.target.x = 0; drag.target.y = 0;
-      setKnob(0, 0);
+      motionMetaEl.textContent = 'Drag the device model to simulate gyro pitch and roll.';
     });
+    window.addEventListener('resize', layoutSliceStage);
 
     // ------- Upload flow -------
     fileEl.addEventListener('change', async () => {
       const file = fileEl.files?.[0];
       if (!file) return;
-      thumbEl.style.backgroundImage = `url(${URL.createObjectURL(file)})`;
+      if (currentSourceObjectUrl) URL.revokeObjectURL(currentSourceObjectUrl);
+      currentSourceObjectUrl = URL.createObjectURL(file);
+      currentSourceUrl = currentSourceObjectUrl;
+      currentSliceBase = null;
+      currentSlicePreview = null;
+      clearSliceStack();
+
+      thumbEl.style.backgroundImage = `url(${currentSourceUrl})`;
       baseMetaHtml = `<b>${file.name}</b><br>${(file.size / 1024).toFixed(0)} KB`;
       metaEl.innerHTML = baseMetaHtml;
+      setSliceMeta('');
+      setViewMode('mcu');
       setStatus('Uploading & running SHARP… (first run can take a minute while weights load)');
       const startBtn = document.querySelector('label[for=file]');
       startBtn.style.pointerEvents = 'none';
@@ -444,8 +1158,13 @@
         const j = await r.json();
         baseMetaHtml = `<b>${file.name}</b><br>${(j.ply_size/1024/1024).toFixed(1)} MB · ${j.elapsed_sec}s`;
         metaEl.innerHTML = baseMetaHtml;
-        setStatus('Loading splat…');
-        await loadSplat(j.ply_url);
+        currentSplatUrl = j.ply_url;
+
+        void loadSplat(j.ply_url, { announce: false }).catch((err) => {
+          console.warn('splat preview failed:', err);
+        });
+
+        await buildSlicePreview({ forceBase: true });
       } catch (e) {
         console.error(e);
         setStatus(`Error: ${e.message}`, true);
@@ -455,7 +1174,11 @@
       }
     });
 
-    setStatus('Ready. Pick an image to begin.');
+    tiltVal.textContent = `${tiltSlider.value}°`;
+    parVal.textContent = (parSlider.value / 100).toFixed(2);
+    sliceCountVal.textContent = sliceCountSlider.value;
+    setViewMode('mcu');
+    setStatus('Ready. Pick an image to build the MCU slice preview.');
   </script>
 </body>
 </html>
