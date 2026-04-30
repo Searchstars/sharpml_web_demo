@@ -884,13 +884,81 @@
       const lo = boundaries[band];
       const hi = boundaries[band + 1];
       const bandSpan = Math.max(1e-5, hi - lo);
-      const overlap = Math.max(totalSpan * 0.012, bandSpan * 0.35);
+      const denom = Math.max(1, boundaries.length - 2);
+      const nearWeight = 1 - band / denom;
+      const overlap = Math.max(
+        totalSpan * 0.008,
+        bandSpan * (0.18 + (1 - nearWeight) * 0.14),
+      );
       const outerLo = lo - overlap;
       const outerHi = hi + overlap;
       if (depthValue < outerLo || depthValue > outerHi) return 0;
       if (depthValue < lo) return smoothstep01((depthValue - outerLo) / Math.max(1e-5, lo - outerLo));
       if (depthValue > hi) return smoothstep01((outerHi - depthValue) / Math.max(1e-5, outerHi - hi));
       return 1;
+    }
+
+    async function buildGhostReducedBackdrop(base, bandMap, layerCount, token) {
+      const width = base.previewWidth;
+      const height = base.previewHeight;
+      const source = base.sourceRgba;
+      const sharpCanvas = document.createElement('canvas');
+      sharpCanvas.width = width;
+      sharpCanvas.height = height;
+      const sharpCtx = sharpCanvas.getContext('2d');
+      sharpCtx.putImageData(new ImageData(new Uint8ClampedArray(source), width, height), 0, 0);
+
+      const blurCanvas = document.createElement('canvas');
+      blurCanvas.width = width;
+      blurCanvas.height = height;
+      const blurCtx = blurCanvas.getContext('2d', { willReadFrequently: true });
+      const blurPx = Math.max(2, Math.round(Math.min(width, height) * 0.0045));
+      blurCtx.filter = `blur(${blurPx}px)`;
+      blurCtx.drawImage(sharpCanvas, 0, 0);
+      blurCtx.filter = 'none';
+      const blurred = blurCtx.getImageData(0, 0, width, height).data;
+
+      const rgba = new Uint8ClampedArray(source.length);
+      const denom = Math.max(1, layerCount - 1);
+      const yieldEvery = Math.max(1, Math.floor(height / 6));
+      for (let y = 0; y < height; y++) {
+        const row = y * width;
+        for (let x = 0; x < width; x++) {
+          const pixel = row + x;
+          const band = bandMap[pixel];
+          const nearWeight = 1 - band / denom;
+          let maxBandDelta = 0;
+          for (let oy = -1; oy <= 1; oy++) {
+            const sy = y + oy;
+            if (sy < 0 || sy >= height) continue;
+            const sampleRow = sy * width;
+            for (let ox = -1; ox <= 1; ox++) {
+              const sx = x + ox;
+              if (sx < 0 || sx >= width || (!ox && !oy)) continue;
+              const delta = Math.abs(band - bandMap[sampleRow + sx]);
+              if (delta > maxBandDelta) maxBandDelta = delta;
+            }
+          }
+
+          const nearMix = smoothstep01((nearWeight - 0.18) / 0.64);
+          const edgeMix = smoothstep01(maxBandDelta / 2);
+          const blurMix = clamp(nearMix * (0.28 + edgeMix * 0.56), 0, 0.84);
+          const srcIdx = pixel * 4;
+          const invMix = 1 - blurMix;
+          rgba[srcIdx] = Math.round(source[srcIdx] * invMix + blurred[srcIdx] * blurMix);
+          rgba[srcIdx + 1] = Math.round(source[srcIdx + 1] * invMix + blurred[srcIdx + 1] * blurMix);
+          rgba[srcIdx + 2] = Math.round(source[srcIdx + 2] * invMix + blurred[srcIdx + 2] * blurMix);
+          rgba[srcIdx + 3] = source[srcIdx + 3];
+        }
+
+        if (y && y % yieldEvery === 0) {
+          setStatus(`Building anti-ghost backdrop… ${Math.round((y / height) * 100)}%`);
+          await nextFrame();
+          ensureSliceToken(token);
+        }
+      }
+
+      return rgba;
     }
 
     async function renderSlicePreview(base, layerCount, token) {
@@ -910,13 +978,16 @@
       const layers = [];
       const source = base.sourceRgba;
       const denom = Math.max(1, layerCount - 1);
+      setStatus('Building anti-ghost MCU backdrop…');
+      const backdropRgba = await buildGhostReducedBackdrop(base, bandMap, layerCount, token);
+      ensureSliceToken(token);
 
       const backdropCanvas = document.createElement('canvas');
       backdropCanvas.width = base.previewWidth;
       backdropCanvas.height = base.previewHeight;
       backdropCanvas.className = 'slice-layer';
       const backdropCtx = backdropCanvas.getContext('2d');
-      backdropCtx.putImageData(new ImageData(new Uint8ClampedArray(source), base.previewWidth, base.previewHeight), 0, 0);
+      backdropCtx.putImageData(new ImageData(backdropRgba, base.previewWidth, base.previewHeight), 0, 0);
       sliceStack.appendChild(backdropCanvas);
       layers.push({
         canvas: backdropCanvas,
@@ -972,9 +1043,9 @@
       };
 
       setSliceMeta(
-        `<b>MCU preview:</b> ${layerCount} opaque slices (near-dense γ=1.55) + fallback backdrop · `
+        `<b>MCU preview:</b> ${layerCount} opaque slices (near-dense γ=1.55) + anti-ghost backdrop · `
         + `${base.previewWidth}×${base.previewHeight} preview · `
-        + `${Math.round(base.projectedCoverage * 100)}% raw depth coverage · sample 1/${base.sampleStep}`,
+        + `2D rotate+translate+scale only · ${Math.round(base.projectedCoverage * 100)}% raw depth coverage · sample 1/${base.sampleStep}`,
       );
       layoutSliceStage();
       return currentSlicePreview;
@@ -1021,24 +1092,28 @@
       const tiltRange = parseFloat(tiltSlider.value);
       const parallax = parseFloat(parSlider.value) / 100;
       const travel = Math.min(currentSlicePreview.displayWidth, currentSlicePreview.displayHeight) * (0.008 + parallax * 0.105);
-      // Motion magnitude drives all per-layer divergence. At rest every layer
-      // sits on identity (scale=1, tz=0) so the stack reproduces the source
-      // pixel-for-pixel — no scale mismatch, no depth-perspective fringing.
+      // MCU mode stays in 2D affine space only: global rotate plus per-layer
+      // translate + scale. No z translation or perspective transforms.
       const motionMag = Math.min(1, Math.hypot(nx, ny));
+      // Keep rotation as a secondary cue only. If pure left/right tilt drives
+      // z-rotation too strongly, it visually masks the horizontal parallax and
+      // reads like "the whole viewport is spinning". Use a diagonal cross-term
+      // so x still owns the depth cue, while a small roll remains on compound
+      // gestures.
+      const stageRotate = (nx * ny * tiltRange * 0.24).toFixed(2);
 
-      sliceStage.style.transform = `rotateX(${(-ny * tiltRange * 0.17).toFixed(2)}deg) rotateY(${(nx * tiltRange * 0.22).toFixed(2)}deg)`;
+      sliceStage.style.transform = `rotate(${stageRotate}deg)`;
       for (const layer of currentSlicePreview.layers) {
         const weight = layer.isBackdrop
-          ? 0.028
-          : 0.05 + Math.pow(layer.nearWeight, 1.7) * 0.22;
-        const tx = (-nx * travel * weight).toFixed(2);
-        const ty = (ny * travel * weight).toFixed(2);
-        const tz = (layer.isBackdrop ? 0 : motionMag * layer.nearWeight * 16).toFixed(2);
+          ? 0.018
+          : 0.04 + Math.pow(layer.nearWeight, 1.55) * 0.19;
+        const tx = (-nx * travel * weight * 1.18).toFixed(2);
+        const ty = (ny * travel * weight * 0.94).toFixed(2);
         const scaleBoost = motionMag * (
-          layer.isBackdrop ? 0.002 : 0.010 + layer.nearWeight * 0.018
+          layer.isBackdrop ? 0 : 0.004 + layer.nearWeight * 0.010
         );
         const scale = (1 + scaleBoost).toFixed(4);
-        layer.canvas.style.transform = `translate3d(${tx}px, ${ty}px, ${tz}px) scale(${scale})`;
+        layer.canvas.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
       }
     }
 

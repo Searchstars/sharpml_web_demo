@@ -1,0 +1,10 @@
+[package]
+name = "sharp-mcu-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+sharp-mcu-core = { path = "../sharp-mcu-core" }

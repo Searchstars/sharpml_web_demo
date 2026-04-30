@@ -1,0 +1,16 @@
+[package]
+name = "sharp-mcu-preview"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytemuck.workspace = true
+clap.workspace = true
+image.workspace = true
+pollster.workspace = true
+serde_json.workspace = true
+sharp-mcu-core = { path = "../sharp-mcu-core" }
+wgpu.workspace = true
+winit.workspace = true

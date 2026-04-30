@@ -1,0 +1,31 @@
+[workspace]
+members = [
+  "crates/sharp-mcu-core",
+  "crates/sharp-mcu-cli",
+  "crates/sharp-mcu-preview",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1.0.102"
+bytemuck = { version = "1.24.0", features = ["derive"] }
+clap = { version = "4.6.1", features = ["derive"] }
+hf-hub = { version = "0.5.0", default-features = false, features = ["ureq"] }
+image = "0.25.10"
+lyon = "1.0.19"
+ndarray = "0.17.2"
+onnx-protobuf = "0.2.3"
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["ndarray", "download-binaries", "copy-dylibs", "preload-dylibs", "std", "api-24", "tls-rustls", "coreml", "cuda", "migraphx"] }
+pollster = "0.4.0"
+protobuf = "=3.4.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+softbuffer = "0.4.8"
+tiny-skia = "0.12.0"
+wgpu = "29.0.1"
+winit = "0.30.12"
