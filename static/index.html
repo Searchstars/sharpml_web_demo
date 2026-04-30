@@ -57,7 +57,8 @@
       height: 100%;
       will-change: transform;
       transform-origin: center center;
-      image-rendering: auto;
+      image-rendering: high-quality;
+      image-rendering: -webkit-optimize-contrast;
     }
 
     .panel {
@@ -366,8 +367,8 @@
     // Camera anchor — set once a splat is loaded.
     const SHARP_FORWARD = new THREE.Vector3(0, 0, 1);
     const SHARP_WORLD_UP = new THREE.Vector3(0, -1, 0);
-    const MCU_PREVIEW_MAX_EDGE = 1920;
-    const MCU_PREVIEW_TARGET_PIXELS = 1920 * 1080;
+    const MCU_PREVIEW_MAX_EDGE = 2560;
+    const MCU_PREVIEW_TARGET_PIXELS = 2560 * 1440;
     const DEPTH_FILL_PASSES = 6;
     const PLY_HEADER_SCAN_BYTES = 65536;
     const PLY_ROW_BYTES = 14 * 4;
@@ -650,6 +651,15 @@
       );
       ensureSliceToken(token);
 
+      setStatus('Median-filtering depth to suppress edge speckle…');
+      await medianFilterDepth(
+        depthFill.depth,
+        previewSize.width,
+        previewSize.height,
+        token,
+      );
+      ensureSliceToken(token);
+
       currentSliceBase = {
         sourceUrl,
         plyUrl,
@@ -799,6 +809,37 @@
       return { depth: src, minDepth, maxDepth };
     }
 
+    async function medianFilterDepth(depth, width, height, token) {
+      // 3×3 median pass: suppresses single-pixel depth outliers caused by
+      // sparse PLY stamping near edges, while preserving real depth steps.
+      const dst = new Float32Array(depth.length);
+      const window = new Float32Array(9);
+      const yieldEvery = Math.max(1, Math.floor(height / 6));
+      for (let y = 0; y < height; y++) {
+        const yMin = y > 0 ? y - 1 : 0;
+        const yMax = y < height - 1 ? y + 1 : height - 1;
+        for (let x = 0; x < width; x++) {
+          const xMin = x > 0 ? x - 1 : 0;
+          const xMax = x < width - 1 ? x + 1 : width - 1;
+          let n = 0;
+          for (let sy = yMin; sy <= yMax; sy++) {
+            const row = sy * width;
+            for (let sx = xMin; sx <= xMax; sx++) {
+              window[n++] = depth[row + sx];
+            }
+          }
+          window.subarray(0, n).sort();
+          dst[y * width + x] = window[n >> 1];
+        }
+        if (y && y % yieldEvery === 0) {
+          setStatus(`Median-filtering depth… ${Math.round((y / height) * 100)}%`);
+          await nextFrame();
+          ensureSliceToken(token);
+        }
+      }
+      depth.set(dst);
+    }
+
     function computeDepthBoundaries(depth, layerCount) {
       const samples = [];
       const stride = Math.max(1, Math.floor(depth.length / 220000));
@@ -807,13 +848,20 @@
         if (Number.isFinite(value)) samples.push(value);
       }
       samples.sort((a, b) => a - b);
+      // Non-linear slicing: near-dense, far-sparse. Foreground gets tighter
+      // bands (more depth resolution where detail matters); far gets fewer
+      // wider bands (avoids splitting fuzzy far depths across many layers).
+      const gamma = 1.55;
+      const last = samples.length - 1;
       const boundaries = new Float32Array(layerCount + 1);
       boundaries[0] = samples[0];
       for (let i = 1; i < layerCount; i++) {
-        const index = Math.min(samples.length - 1, Math.floor((samples.length - 1) * (i / layerCount)));
+        const t = i / layerCount;
+        const warped = Math.pow(t, gamma);
+        const index = Math.min(last, Math.floor(last * warped));
         boundaries[i] = samples[index];
       }
-      boundaries[layerCount] = samples[samples.length - 1] + 1e-5;
+      boundaries[layerCount] = samples[last] + 1e-5;
       for (let i = 1; i < boundaries.length; i++) {
         if (boundaries[i] <= boundaries[i - 1]) boundaries[i] = boundaries[i - 1] + 1e-5;
       }
@@ -827,47 +875,22 @@
       return boundaries.length - 2;
     }
 
-    function expandLayerEdges(rgba, width, height, passes) {
-      let src = rgba;
-      let dst = new Uint8ClampedArray(rgba.length);
-      const rowStride = width * 4;
+    function smoothstep01(t) {
+      const x = clamp(t, 0, 1);
+      return x * x * (3 - 2 * x);
+    }
 
-      for (let pass = 0; pass < passes; pass++) {
-        let changed = false;
-        dst.set(src);
-        for (let y = 1; y < height - 1; y++) {
-          for (let x = 1; x < width - 1; x++) {
-            const idx = (y * width + x) * 4;
-            if (src[idx + 3]) continue;
-            const neighbors = [
-              idx - 4,
-              idx + 4,
-              idx - rowStride,
-              idx + rowStride,
-              idx - rowStride - 4,
-              idx - rowStride + 4,
-              idx + rowStride - 4,
-              idx + rowStride + 4,
-            ];
-            let copied = false;
-            for (const n of neighbors) {
-              if (!src[n + 3]) continue;
-              dst[idx] = src[n];
-              dst[idx + 1] = src[n + 1];
-              dst[idx + 2] = src[n + 2];
-              dst[idx + 3] = src[n + 3];
-              copied = true;
-              changed = true;
-              break;
-            }
-            if (!copied) dst[idx + 3] = 0;
-          }
-        }
-        [src, dst] = [dst, src];
-        if (!changed) break;
-      }
-
-      if (src !== rgba) rgba.set(src);
+    function layerAlphaForDepth(depthValue, band, boundaries, totalSpan) {
+      const lo = boundaries[band];
+      const hi = boundaries[band + 1];
+      const bandSpan = Math.max(1e-5, hi - lo);
+      const overlap = Math.max(totalSpan * 0.012, bandSpan * 0.35);
+      const outerLo = lo - overlap;
+      const outerHi = hi + overlap;
+      if (depthValue < outerLo || depthValue > outerHi) return 0;
+      if (depthValue < lo) return smoothstep01((depthValue - outerLo) / Math.max(1e-5, lo - outerLo));
+      if (depthValue > hi) return smoothstep01((outerHi - depthValue) / Math.max(1e-5, outerHi - hi));
+      return 1;
     }
 
     async function renderSlicePreview(base, layerCount, token) {
@@ -875,6 +898,7 @@
       const boundaries = computeDepthBoundaries(base.depth, layerCount);
       const bandMap = new Uint8Array(totalPixels);
       const bandPixels = new Uint32Array(layerCount);
+      const totalDepthSpan = Math.max(1e-5, boundaries[boundaries.length - 1] - boundaries[0]);
 
       for (let i = 0; i < totalPixels; i++) {
         const band = depthBandForValue(base.depth[i], boundaries);
@@ -907,18 +931,20 @@
         ensureSliceToken(token);
 
         const rgba = new Uint8ClampedArray(totalPixels * 4);
+        const nearWeight = 1 - band / denom;
         for (let i = 0; i < totalPixels; i++) {
-          if (bandMap[i] !== band) continue;
+          const alphaWeight = layerAlphaForDepth(base.depth[i], band, boundaries, totalDepthSpan);
+          if (alphaWeight <= 0) continue;
           const srcIdx = i * 4;
           rgba[srcIdx] = source[srcIdx];
           rgba[srcIdx + 1] = source[srcIdx + 1];
           rgba[srcIdx + 2] = source[srcIdx + 2];
-          rgba[srcIdx + 3] = source[srcIdx + 3];
+          rgba[srcIdx + 3] = alphaWeight >= 1
+            ? source[srcIdx + 3]
+            : Math.round(source[srcIdx + 3] * alphaWeight);
         }
-
-        const nearWeight = 1 - band / denom;
-        const expansionPasses = 1 + Math.round((1 - nearWeight) * 2);
-        expandLayerEdges(rgba, base.previewWidth, base.previewHeight, expansionPasses);
+        // No pixel-dilation pass — sharp layer cores plus the full-resolution
+        // backdrop underneath cover any parallax holes without smearing edges.
 
         const canvas = document.createElement('canvas');
         canvas.width = base.previewWidth;
@@ -946,7 +972,8 @@
       };
 
       setSliceMeta(
-        `<b>MCU preview:</b> ${layerCount} slices + backdrop · ${base.previewWidth}×${base.previewHeight} preview · `
+        `<b>MCU preview:</b> ${layerCount} opaque slices (near-dense γ=1.55) + fallback backdrop · `
+        + `${base.previewWidth}×${base.previewHeight} preview · `
         + `${Math.round(base.projectedCoverage * 100)}% raw depth coverage · sample 1/${base.sampleStep}`,
       );
       layoutSliceStage();
@@ -993,21 +1020,24 @@
       if (!currentSlicePreview) return;
       const tiltRange = parseFloat(tiltSlider.value);
       const parallax = parseFloat(parSlider.value) / 100;
-      const travel = Math.min(currentSlicePreview.displayWidth, currentSlicePreview.displayHeight) * (0.010 + parallax * 0.140);
+      const travel = Math.min(currentSlicePreview.displayWidth, currentSlicePreview.displayHeight) * (0.008 + parallax * 0.105);
+      // Motion magnitude drives all per-layer divergence. At rest every layer
+      // sits on identity (scale=1, tz=0) so the stack reproduces the source
+      // pixel-for-pixel — no scale mismatch, no depth-perspective fringing.
+      const motionMag = Math.min(1, Math.hypot(nx, ny));
 
-      sliceStage.style.transform = `rotateX(${(-ny * tiltRange * 0.20).toFixed(2)}deg) rotateY(${(nx * tiltRange * 0.26).toFixed(2)}deg)`;
+      sliceStage.style.transform = `rotateX(${(-ny * tiltRange * 0.17).toFixed(2)}deg) rotateY(${(nx * tiltRange * 0.22).toFixed(2)}deg)`;
       for (const layer of currentSlicePreview.layers) {
         const weight = layer.isBackdrop
-          ? 0.05
-          : 0.08 + Math.pow(layer.nearWeight, 1.55) * 0.32;
+          ? 0.028
+          : 0.05 + Math.pow(layer.nearWeight, 1.7) * 0.22;
         const tx = (-nx * travel * weight).toFixed(2);
         const ty = (ny * travel * weight).toFixed(2);
-        const tz = (layer.isBackdrop ? 0 : layer.nearWeight * 18).toFixed(2);
-        const scale = (
-          (layer.isBackdrop ? 1.018 : 1.022 + layer.nearWeight * 0.026)
-          + Math.abs(nx) * 0.006
-          + Math.abs(ny) * 0.006
-        ).toFixed(4);
+        const tz = (layer.isBackdrop ? 0 : motionMag * layer.nearWeight * 16).toFixed(2);
+        const scaleBoost = motionMag * (
+          layer.isBackdrop ? 0.002 : 0.010 + layer.nearWeight * 0.018
+        );
+        const scale = (1 + scaleBoost).toFixed(4);
         layer.canvas.style.transform = `translate3d(${tx}px, ${ty}px, ${tz}px) scale(${scale})`;
       }
     }
