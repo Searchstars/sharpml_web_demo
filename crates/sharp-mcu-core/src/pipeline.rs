@@ -44,7 +44,7 @@ impl Default for GenerateConfig {
             debug_ply_decimation: 1.0,
             depth_fill_passes: 6,
             gamma: 1.55,
-            blur_backdrop_scale: 0.0045,
+            blur_backdrop_scale: 0.006,
             tilt_default_deg: 12.0,
             parallax_default: 0.10,
             emit_debug_ply: true,
@@ -138,12 +138,20 @@ pub fn generate_package(request: &GenerateRequest) -> Result<GenerateReport> {
         preview_size.width,
         preview_size.height,
     );
-
     let boundaries = compute_depth_boundaries(
         &projected.depth,
         request.config.layer_count,
         request.config.gamma,
     );
+    let model_completion = project_model_completion_from_outputs(
+        &outputs,
+        &prepared,
+        preview_size.width,
+        preview_size.height,
+        &projected.depth,
+        &boundaries,
+        request.config.layer_count,
+    )?;
     let total_pixels = (preview_size.width as usize) * (preview_size.height as usize);
     let mut band_map = vec![0u8; total_pixels];
     let mut band_pixels = vec![0u32; request.config.layer_count];
@@ -161,11 +169,12 @@ pub fn generate_package(request: &GenerateRequest) -> Result<GenerateReport> {
         band_pixels[band as usize] += 1;
     }
 
-    let backdrop = build_ghost_reduced_backdrop(
+    let backdrop = build_inpainted_backdrop(
         &source_preview,
         &band_map,
         request.config.layer_count,
         request.config.blur_backdrop_scale,
+        Some(&model_completion),
     );
     let backdrop_path = request.output_dir.join("backdrop.png");
     backdrop.save(&backdrop_path)?;
@@ -359,6 +368,12 @@ struct ProjectedDepth {
     sample_step: usize,
 }
 
+#[derive(Debug, Clone)]
+struct ModelCompletion {
+    image: RgbaImage,
+    confidence: Vec<f32>,
+}
+
 fn fit_size(
     width: u32,
     height: u32,
@@ -451,6 +466,140 @@ fn project_depth_map_from_outputs(
         coverage: filled as f32 / ((target_width as usize) * (target_height as usize)) as f32,
         sample_step,
     })
+}
+
+fn project_model_completion_from_outputs(
+    outputs: &SharpOutputs,
+    prepared: &PreparedImage,
+    target_width: u32,
+    target_height: u32,
+    front_depth: &[f32],
+    boundaries: &[f32],
+    layer_count: usize,
+) -> Result<ModelCompletion> {
+    if outputs.mean_vectors.ncols() != 3 || outputs.colors.ncols() < 3 {
+        bail!("SHARP outputs must include xyz mean vectors and RGB colors");
+    }
+    let width = target_width as usize;
+    let height = target_height as usize;
+    let len = width * height;
+    if front_depth.len() != len {
+        bail!("front depth length does not match target image size");
+    }
+
+    let mut seed_rgb = vec![[0u8; 3]; len];
+    let mut seed_confidence = vec![0.0f32; len];
+    let mut best_back_depth = vec![f32::INFINITY; len];
+    let z_min = outputs
+        .mean_vectors
+        .column(2)
+        .iter()
+        .copied()
+        .filter(|z| z.is_finite() && *z > 1e-5)
+        .fold(f32::INFINITY, f32::min);
+    if !z_min.is_finite() {
+        return Ok(ModelCompletion {
+            image: RgbaImage::new(target_width, target_height),
+            confidence: seed_confidence,
+        });
+    }
+
+    let focal_ndc = 2.0 * prepared.focal_length_px / prepared.original_width as f32;
+    let scale_factor = 1.0 / (z_min * focal_ndc);
+    let scale_x = target_width as f32 / prepared.original_width as f32;
+    let scale_y = target_height as f32 / prepared.original_height as f32;
+    let min_completion_band = ((layer_count as f32) * 0.60).round() as usize;
+
+    // Use SHARP's own deeper splats as occlusion-completion seeds. If a splat
+    // projects to a pixel but sits behind the front z-buffer, it is exactly the
+    // kind of "not in the original photograph but present in the splat volume"
+    // content that novel-view rendering can reveal.
+    for idx in 0..outputs.mean_vectors.nrows() {
+        let z_raw = outputs.mean_vectors[[idx, 2]];
+        if !(z_raw > 1e-5) || !z_raw.is_finite() {
+            continue;
+        }
+        let z = z_raw / z_min;
+        let x = outputs.mean_vectors[[idx, 0]] * scale_factor;
+        let y = outputs.mean_vectors[[idx, 1]] * scale_factor;
+        let u = prepared.focal_length_px * x / z + prepared.original_width as f32 / 2.0;
+        let v = prepared.focal_length_px * y / z + prepared.original_height as f32 / 2.0;
+        let px = (u * scale_x).round() as i32;
+        let py = (v * scale_y).round() as i32;
+        if px < 0 || px >= target_width as i32 || py < 0 || py >= target_height as i32 {
+            continue;
+        }
+
+        let slot = py as usize * width + px as usize;
+        let front = front_depth[slot];
+        if !front.is_finite() {
+            continue;
+        }
+        let gap = z - front;
+        let min_gap = (front * 0.012).max(0.035);
+        if gap <= min_gap || z >= best_back_depth[slot] {
+            continue;
+        }
+        if depth_band_for_value(z, boundaries) < min_completion_band {
+            continue;
+        }
+        let opacity = outputs.opacities[idx].clamp(0.0, 1.0);
+        if opacity < 0.025 {
+            continue;
+        }
+
+        best_back_depth[slot] = z;
+        seed_rgb[slot] = [
+            linear_to_srgb_u8(outputs.colors[[idx, 0]]),
+            linear_to_srgb_u8(outputs.colors[[idx, 1]]),
+            linear_to_srgb_u8(outputs.colors[[idx, 2]]),
+        ];
+        let depth_confidence = (1.0 / (1.0 + gap * 0.08)).clamp(0.25, 1.0);
+        seed_confidence[slot] = (opacity.sqrt() * depth_confidence).clamp(0.0, 1.0);
+    }
+
+    if !seed_confidence.iter().any(|&confidence| confidence > 0.0) {
+        return Ok(ModelCompletion {
+            image: RgbaImage::new(target_width, target_height),
+            confidence: seed_confidence,
+        });
+    }
+
+    let mut nearest_a = vec![(-1i32, -1i32); len];
+    let mut nearest_b = vec![(-1i32, -1i32); len];
+    jfa_nearest(
+        |idx| seed_confidence[idx] > 0.0,
+        width,
+        height,
+        &mut nearest_a,
+        &mut nearest_b,
+    );
+
+    let fill_radius = (target_width.min(target_height) as f32 * 0.085).max(36.0);
+    let fill_radius_sq = fill_radius * fill_radius;
+    let mut image = RgbaImage::new(target_width, target_height);
+    let mut confidence = vec![0.0f32; len];
+    for y in 0..target_height {
+        for x in 0..target_width {
+            let idx = y as usize * width + x as usize;
+            let (sx, sy) = nearest_a[idx];
+            if sx < 0 {
+                continue;
+            }
+            let seed_idx = sy as usize * width + sx as usize;
+            let dx = sx as f32 - x as f32;
+            let dy = sy as f32 - y as f32;
+            let distance_fade = 1.0 - smoothstep01((dx * dx + dy * dy) / fill_radius_sq);
+            let c = (seed_confidence[seed_idx] * distance_fade).clamp(0.0, 1.0);
+            confidence[idx] = c;
+            let rgb = seed_rgb[seed_idx];
+            image.put_pixel(x, y, Rgba([rgb[0], rgb[1], rgb[2], (c * 255.0) as u8]));
+        }
+    }
+
+    let sigma = (target_width.min(target_height) as f32 * 0.006).max(2.0);
+    let image = imageops::blur(&image, sigma);
+    Ok(ModelCompletion { image, confidence })
 }
 
 fn fill_depth_holes(
@@ -705,7 +854,242 @@ fn neighbor_indices(
     neighbors.into_iter().take(n)
 }
 
-fn build_ghost_reduced_backdrop(
+fn jfa_pass(src: &[(i32, i32)], dst: &mut [(i32, i32)], width: usize, height: usize, step: usize) {
+    for y in 0..height as i32 {
+        for x in 0..width as i32 {
+            let here = y as usize * width + x as usize;
+            let mut best = src[here];
+            let mut best_dist = if best.0 < 0 {
+                i64::MAX
+            } else {
+                let dx = (best.0 - x) as i64;
+                let dy = (best.1 - y) as i64;
+                dx * dx + dy * dy
+            };
+            let s = step as i32;
+            for oy in [-s, 0, s] {
+                for ox in [-s, 0, s] {
+                    if ox == 0 && oy == 0 {
+                        continue;
+                    }
+                    let nx = x + ox;
+                    let ny = y + oy;
+                    if nx < 0 || ny < 0 || nx >= width as i32 || ny >= height as i32 {
+                        continue;
+                    }
+                    let candidate = src[ny as usize * width + nx as usize];
+                    if candidate.0 < 0 {
+                        continue;
+                    }
+                    let dx = (candidate.0 - x) as i64;
+                    let dy = (candidate.1 - y) as i64;
+                    let d = dx * dx + dy * dy;
+                    if d < best_dist {
+                        best_dist = d;
+                        best = candidate;
+                    }
+                }
+            }
+            dst[here] = best;
+        }
+    }
+}
+
+fn jfa_nearest<F>(
+    is_seed: F,
+    width: usize,
+    height: usize,
+    buf_a: &mut [(i32, i32)],
+    buf_b: &mut [(i32, i32)],
+) where
+    F: Fn(usize) -> bool,
+{
+    let len = width * height;
+    for idx in 0..len {
+        if is_seed(idx) {
+            buf_a[idx] = ((idx % width) as i32, (idx / width) as i32);
+        } else {
+            buf_a[idx] = (-1, -1);
+        }
+    }
+
+    let mut step = (width.max(height) / 2).max(1);
+    let mut a_holds_latest = true;
+    loop {
+        if a_holds_latest {
+            jfa_pass(buf_a, buf_b, width, height, step);
+        } else {
+            jfa_pass(buf_b, buf_a, width, height, step);
+        }
+        a_holds_latest = !a_holds_latest;
+        if step == 1 {
+            break;
+        }
+        step /= 2;
+    }
+    if !a_holds_latest {
+        buf_a.copy_from_slice(buf_b);
+    }
+}
+
+fn erode_mask(mask: &[bool], width: usize, height: usize, radius: i32) -> Vec<bool> {
+    let len = width * height;
+    let mut horiz = vec![false; len];
+    for y in 0..height {
+        for x in 0..width {
+            let mut ok = true;
+            for ox in -radius..=radius {
+                let sx = x as i32 + ox;
+                if sx < 0 || sx >= width as i32 || !mask[y * width + sx as usize] {
+                    ok = false;
+                    break;
+                }
+            }
+            horiz[y * width + x] = ok;
+        }
+    }
+
+    let mut out = vec![false; len];
+    for y in 0..height {
+        for x in 0..width {
+            let mut ok = true;
+            for oy in -radius..=radius {
+                let sy = y as i32 + oy;
+                if sy < 0 || sy >= height as i32 || !horiz[sy as usize * width + x] {
+                    ok = false;
+                    break;
+                }
+            }
+            out[y * width + x] = ok;
+        }
+    }
+    out
+}
+
+fn build_inpainted_backdrop(
+    source: &RgbaImage,
+    band_map: &[u8],
+    layer_count: usize,
+    blur_scale: f32,
+    model_completion: Option<&ModelCompletion>,
+) -> RgbaImage {
+    let (width, height) = source.dimensions();
+    let width_usize = width as usize;
+    let height_usize = height as usize;
+    let len = width_usize * height_usize;
+    if len == 0 {
+        return RgbaImage::new(width, height);
+    }
+    let legacy = build_soft_blur_backdrop(source, band_map, layer_count, blur_scale);
+
+    let seed_band_threshold = ((layer_count as f32) * 0.72).round() as u8;
+    let erode_radius = ((width.min(height) as f32 * 0.008).round() as i32).clamp(3, 12);
+    let mut raw_seed = vec![false; len];
+    for idx in 0..len {
+        raw_seed[idx] = band_map[idx] >= seed_band_threshold;
+    }
+    let mut strict_seed = erode_mask(&raw_seed, width_usize, height_usize, erode_radius);
+    if !strict_seed.iter().any(|&v| v) {
+        strict_seed = raw_seed;
+    }
+
+    let mut nearest_a = vec![(-1i32, -1i32); len];
+    let mut nearest_b = vec![(-1i32, -1i32); len];
+    jfa_nearest(
+        |idx| strict_seed[idx],
+        width_usize,
+        height_usize,
+        &mut nearest_a,
+        &mut nearest_b,
+    );
+
+    let mut filled = RgbaImage::new(width, height);
+    for y in 0..height {
+        for x in 0..width {
+            let idx = y as usize * width_usize + x as usize;
+            let (sx, sy) = nearest_a[idx];
+            let pixel = if sx < 0 {
+                source.get_pixel(x, y).0
+            } else {
+                source.get_pixel(sx as u32, sy as u32).0
+            };
+            filled.put_pixel(x, y, Rgba(pixel));
+        }
+    }
+
+    let min_edge = width.min(height) as f32;
+    let patch_sigma = (min_edge * 0.012).max(4.0);
+    let patched = imageops::blur(&filled, patch_sigma);
+    let inner_radius = (min_edge * 0.008).max(6.0);
+    let outer_radius = (min_edge * 0.032).max(18.0);
+    let inner_radius_sq = inner_radius * inner_radius;
+    let outer_radius_sq = outer_radius * outer_radius;
+    let mut output = RgbaImage::new(width, height);
+    for y in 0..height {
+        for x in 0..width {
+            let idx = y as usize * width_usize + x as usize;
+            let (sx, sy) = nearest_a[idx];
+            let seed_dist_sq = if sx < 0 {
+                outer_radius_sq * 4.0
+            } else {
+                let dx = sx as f32 - x as f32;
+                let dy = sy as f32 - y as f32;
+                dx * dx + dy * dy
+            };
+            let base = legacy.get_pixel(x, y).0;
+            let jfa_mix = if strict_seed[idx] {
+                0.0
+            } else {
+                let fade_in = smoothstep01(seed_dist_sq / inner_radius_sq);
+                let fade_out = 1.0 - smoothstep01(seed_dist_sq / outer_radius_sq);
+                (fade_in * fade_out * 0.55).clamp(0.0, 0.55)
+            };
+            let denom = layer_count.saturating_sub(1).max(1) as f32;
+            let near_weight = 1.0 - band_map[idx] as f32 / denom;
+            let patch = patched.get_pixel(x, y).0;
+            let completion = model_completion
+                .map(|completion| completion.image.get_pixel(x, y).0)
+                .unwrap_or(patch);
+            let completion_mix = model_completion
+                .map(|completion_map| {
+                    let enter_midground = smoothstep01((near_weight - 0.22) / 0.35);
+                    let leave_nearest = 1.0 - smoothstep01((near_weight - 0.78) / 0.14);
+                    let midground = enter_midground * leave_nearest;
+                    let delta = (completion[0] as f32 - base[0] as f32).abs()
+                        + (completion[1] as f32 - base[1] as f32).abs()
+                        + (completion[2] as f32 - base[2] as f32).abs();
+                    let color_agreement = 1.0 - smoothstep01((delta - 42.0) / 96.0);
+                    (completion_map.confidence[idx] * midground * color_agreement * 0.18)
+                        .clamp(0.0, 0.18)
+                })
+                .unwrap_or(0.0);
+            let jfa_mix = (jfa_mix * (1.0 - completion_mix)).clamp(0.0, 1.0);
+            let inv = (1.0 - completion_mix - jfa_mix).clamp(0.0, 1.0);
+            output.put_pixel(
+                x,
+                y,
+                Rgba([
+                    (base[0] as f32 * inv
+                        + completion[0] as f32 * completion_mix
+                        + patch[0] as f32 * jfa_mix)
+                        .round() as u8,
+                    (base[1] as f32 * inv
+                        + completion[1] as f32 * completion_mix
+                        + patch[1] as f32 * jfa_mix)
+                        .round() as u8,
+                    (base[2] as f32 * inv
+                        + completion[2] as f32 * completion_mix
+                        + patch[2] as f32 * jfa_mix)
+                        .round() as u8,
+                    base[3],
+                ]),
+            );
+        }
+    }
+    output
+}
+
+fn build_soft_blur_backdrop(
     source: &RgbaImage,
     band_map: &[u8],
     layer_count: usize,
