@@ -605,16 +605,9 @@ fn build_layer_rgba(
     boundaries: &[f32],
     total_span: f32,
 ) -> RgbaImage {
-    // Layers are stored with premultiplied alpha so the bilinear-sampling
-    // preview pipeline doesn't paint dark contour-tracing halos along every
-    // opaque/transparent edge (which is what straight alpha + bilinear
-    // filtering produces — RGB falls off as α² across edges).
-    //
-    // Crucially the premultiply must happen in LINEAR light, not sRGB. Doing
-    // `rgb_srgb * alpha` and then storing through Rgba8UnormSrgb darkens
-    // partial-coverage texels by roughly the gamma curve (e.g. an α=0.5 red
-    // texel ends up sampling as ~0.21 instead of 0.5 in linear space), which
-    // shows up as desaturated gray patches following every band edge.
+    // Layers are stored with premultiplied alpha (computed in LINEAR light,
+    // re-encoded to sRGB) so the bilinear-sampling preview pipeline doesn't
+    // paint dark contour-tracing halos along every opaque/transparent edge.
     let (width, height) = source.dimensions();
     let mut output = RgbaImage::new(width, height);
     for (idx, pixel) in output.pixels_mut().enumerate() {
@@ -636,6 +629,100 @@ fn build_layer_rgba(
         ]);
     }
     output
+}
+
+/// One Jump-Flooding pass: read seed positions from `src`, write the nearest
+/// known seed for each pixel into `dst`.
+fn jfa_pass(
+    src: &[(i32, i32)],
+    dst: &mut [(i32, i32)],
+    width: usize,
+    height: usize,
+    step: usize,
+) {
+    for y in 0..height as i32 {
+        for x in 0..width as i32 {
+            let here = (y as usize) * width + x as usize;
+            let mut best = src[here];
+            let mut best_dist = if best.0 < 0 {
+                i64::MAX
+            } else {
+                let dx = (best.0 - x) as i64;
+                let dy = (best.1 - y) as i64;
+                dx * dx + dy * dy
+            };
+            let s = step as i32;
+            for oy in &[-s, 0, s] {
+                for ox in &[-s, 0, s] {
+                    if *ox == 0 && *oy == 0 {
+                        continue;
+                    }
+                    let nx = x + *ox;
+                    let ny = y + *oy;
+                    if nx < 0 || ny < 0 || nx >= width as i32 || ny >= height as i32 {
+                        continue;
+                    }
+                    let candidate = src[(ny as usize) * width + nx as usize];
+                    if candidate.0 < 0 {
+                        continue;
+                    }
+                    let dx = (candidate.0 - x) as i64;
+                    let dy = (candidate.1 - y) as i64;
+                    let d = dx * dx + dy * dy;
+                    if d < best_dist {
+                        best_dist = d;
+                        best = candidate;
+                    }
+                }
+            }
+            dst[here] = best;
+        }
+    }
+}
+
+/// Jump Flooding Algorithm: for every pixel populates `buf_a` with the (x, y)
+/// of the nearest pixel that satisfies `is_seed(idx)`, or (-1, -1) if no such
+/// pixel exists in the image. `buf_b` is scratch space; both buffers are
+/// reused across calls so the per-layer loop avoids reallocations.
+fn jfa_nearest<F>(
+    is_seed: F,
+    width: usize,
+    height: usize,
+    buf_a: &mut [(i32, i32)],
+    buf_b: &mut [(i32, i32)],
+) where
+    F: Fn(usize) -> bool,
+{
+    let len = width * height;
+    debug_assert_eq!(buf_a.len(), len);
+    debug_assert_eq!(buf_b.len(), len);
+    for idx in 0..len {
+        if is_seed(idx) {
+            let x = (idx % width) as i32;
+            let y = (idx / width) as i32;
+            buf_a[idx] = (x, y);
+        } else {
+            buf_a[idx] = (-1, -1);
+        }
+    }
+
+    let mut step = (width.max(height) / 2).max(1);
+    let mut a_holds_latest = true;
+    loop {
+        if a_holds_latest {
+            jfa_pass(buf_a, buf_b, width, height, step);
+        } else {
+            jfa_pass(buf_b, buf_a, width, height, step);
+        }
+        a_holds_latest = !a_holds_latest;
+        if step == 1 {
+            break;
+        }
+        step /= 2;
+    }
+    if !a_holds_latest {
+        buf_a.copy_from_slice(buf_b);
+    }
 }
 
 fn srgb_u8_to_linear(value: u8) -> f32 {
@@ -746,12 +833,13 @@ fn build_inpainted_backdrop(
     // Stricter seed threshold + aggressive erosion: only pixels that are
     // genuinely deep inside the far-band region count as JFA seeds, never the
     // silhouette ring (whose colors are a mix of foreground and background and
-    // would propagate "edge-of-foliage green" inward). The erode radius scales
-    // with the preview size — small previews can use radius 4, large ones 8+,
-    // because what matters is removing the sub-pixel-fuzzy depth silhouette.
-    let seed_band_threshold = ((layer_count as f32) * 0.62).round() as u8;
+    // would propagate "edge-of-foliage green" inward). 0.74 keeps just the
+    // deepest ~26% of bands as seeds — sky, far horizon, distant walls only.
+    // The erode radius scales with preview size; what matters is putting strict
+    // seeds well clear of any depth-fuzzy silhouette.
+    let seed_band_threshold = ((layer_count as f32) * 0.74).round() as u8;
     let seed_erode_radius =
-        ((width.min(height) as f32 * 0.008).round() as i32).clamp(3, 12);
+        ((width.min(height) as f32 * 0.012).round() as i32).clamp(4, 16);
 
     let mut raw_seed = vec![false; len];
     for idx in 0..len {
@@ -795,77 +883,23 @@ fn build_inpainted_backdrop(
     if !strict_seed.iter().any(|&v| v) {
         strict_seed = raw_seed.clone();
     }
-    const NONE: i32 = i32::MIN;
-    let mut buf_a: Vec<(i32, i32)> = vec![(NONE, NONE); len];
-    for idx in 0..len {
-        if strict_seed[idx] {
-            let x = (idx % width) as i32;
-            let y = (idx / width) as i32;
-            buf_a[idx] = (x, y);
-        }
-    }
-    let mut buf_b: Vec<(i32, i32)> = buf_a.clone();
-
-    let mut step = (width.max(height) / 2).max(1);
-    let mut read_from_a = true;
-    loop {
-        let (src_buf, dst_buf) = if read_from_a {
-            (&buf_a, &mut buf_b)
-        } else {
-            (&buf_b, &mut buf_a)
-        };
-        for y in 0..height as i32 {
-            for x in 0..width as i32 {
-                let here = (y as usize) * width + x as usize;
-                let mut best = src_buf[here];
-                let mut best_dist = if best.0 == NONE {
-                    i64::MAX
-                } else {
-                    let dx = (best.0 - x) as i64;
-                    let dy = (best.1 - y) as i64;
-                    dx * dx + dy * dy
-                };
-                let s = step as i32;
-                for oy in &[-s, 0, s] {
-                    for ox in &[-s, 0, s] {
-                        if *ox == 0 && *oy == 0 {
-                            continue;
-                        }
-                        let nx = x + *ox;
-                        let ny = y + *oy;
-                        if nx < 0 || ny < 0 || nx >= width as i32 || ny >= height as i32 {
-                            continue;
-                        }
-                        let candidate = src_buf[(ny as usize) * width + nx as usize];
-                        if candidate.0 == NONE {
-                            continue;
-                        }
-                        let dx = (candidate.0 - x) as i64;
-                        let dy = (candidate.1 - y) as i64;
-                        let d = dx * dx + dy * dy;
-                        if d < best_dist {
-                            best_dist = d;
-                            best = candidate;
-                        }
-                    }
-                }
-                dst_buf[here] = best;
-            }
-        }
-        read_from_a = !read_from_a;
-        if step == 1 {
-            break;
-        }
-        step /= 2;
-    }
-    let nearest = if read_from_a { &buf_a } else { &buf_b };
+    let mut buf_a = vec![(-1i32, -1i32); len];
+    let mut buf_b = vec![(-1i32, -1i32); len];
+    jfa_nearest(
+        |idx| strict_seed[idx],
+        width,
+        height,
+        &mut buf_a,
+        &mut buf_b,
+    );
+    let nearest = &buf_a;
 
     let mut filled = RgbaImage::new(w, h);
     for y in 0..height as u32 {
         for x in 0..width as u32 {
             let here = (y as usize) * width + x as usize;
             let (sx, sy) = nearest[here];
-            let pixel = if sx == NONE {
+            let pixel = if sx < 0 {
                 source.get_pixel(x, y).0
             } else {
                 source.get_pixel(sx as u32, sy as u32).0
@@ -880,12 +914,16 @@ fn build_inpainted_backdrop(
     // nearest seed (which JFA already gave us), so we don't get a hard
     // boundary between sharp source and blurry fill.
     let small_sigma = (w.min(h) as f32 * blur_scale).max(2.0);
-    let heavy_sigma = (w.min(h) as f32 * 0.04).max(small_sigma * 4.0);
+    // Heavy blur takes the inpainted region toward a near-flat color blob —
+    // anything WITHOUT visible edges translates without producing a "ghost
+    // outline" when the foreground layer drifts past it during big parallax.
+    let heavy_sigma = (w.min(h) as f32 * 0.07).max(small_sigma * 6.0);
     let lightly_smoothed = imageops::blur(&filled, small_sigma);
     let heavily_smoothed = imageops::blur(&filled, heavy_sigma);
     // Feather radius (pixels): how far the seed→inpaint transition is spread.
-    // Bigger = softer seam, but also bleeds blur into background detail.
-    let feather_radius = ((w.min(h) as f32) * 0.012).max(6.0);
+    // Bigger = softer seam, less perceptible boundary between sharp seed and
+    // blurry inpaint, at the cost of slight detail loss near silhouettes.
+    let feather_radius = ((w.min(h) as f32) * 0.020).max(8.0);
     let feather_sq = feather_radius * feather_radius;
     let mut output = RgbaImage::new(w, h);
     for y in 0..height as u32 {
@@ -893,7 +931,7 @@ fn build_inpainted_backdrop(
             let here = (y as usize) * width + x as usize;
             let (sx, sy) = nearest[here];
             // Distance from this pixel to its nearest strict seed (in px²).
-            let seed_dist_sq = if sx == NONE {
+            let seed_dist_sq = if sx < 0 {
                 feather_sq * 4.0
             } else {
                 let dx = sx as f32 - x as f32;
@@ -939,11 +977,13 @@ fn layer_alpha_for_depth(
     let band_span = (hi - lo).max(1e-5);
     let denom = boundaries.len().saturating_sub(2).max(1) as f32;
     let near_weight = 1.0 - band as f32 / denom;
-    // Wider overlap (~0.5 of band_span) so adjacent layers significantly
-    // co-occupy each pixel near band borders. With bipolar parallax pulling
-    // layers apart, narrow overlap leaves visible seams; broad overlap turns
-    // discrete bands into a continuous depth gradient at compositing time.
-    let overlap = (total_span * 0.012).max(band_span * (0.50 + (1.0 - near_weight) * 0.20));
+    // Narrow overlap (~0.25 of band_span). Wider overlap was previously used
+    // to hide seams, but at large parallax it produces "double image" ghosts:
+    // when the same pixel has α=0.4 in layer B and α=0.6 in B+1 with different
+    // translates, you see two faint copies of the same content at different
+    // screen positions. Trimming overlap localizes ghosts to a thin border;
+    // the inpainted backdrop covers the resulting tears.
+    let overlap = (total_span * 0.008).max(band_span * (0.20 + (1.0 - near_weight) * 0.10));
     let outer_lo = lo - overlap;
     let outer_hi = hi + overlap;
     if depth_value < outer_lo || depth_value > outer_hi {

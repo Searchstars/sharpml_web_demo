@@ -23,6 +23,17 @@ pub struct MotionTuning {
     /// than the symmetric near side.
     #[serde(default = "default_far_gain_factor")]
     pub far_gain_factor: f32,
+    /// Tilt-magnitude saturation (>=0). Applied as `tanh(mag·k)/k` so:
+    ///   * k = 0     → linear (no saturation, original behavior)
+    ///   * k = 1.2   → full-tilt motion ≈ 70 % of linear (moderate cap)
+    ///   * k = 2     → full-tilt motion ≈ 48 % (aggressive cap)
+    /// Small tilts retain the linear response (`f'(0) = 1`); only extreme
+    /// magnitudes get compressed. This caps the worst-case per-layer
+    /// translation without affecting feel at moderate tilts, which directly
+    /// limits how far adjacent bands can drift apart and how much ghost the
+    /// flat-2D-stack approximation can produce.
+    #[serde(default = "default_motion_saturation")]
+    pub motion_saturation: f32,
 }
 
 fn default_focal_near_weight() -> f32 {
@@ -31,6 +42,10 @@ fn default_focal_near_weight() -> f32 {
 
 fn default_far_gain_factor() -> f32 {
     0.8
+}
+
+fn default_motion_saturation() -> f32 {
+    1.3
 }
 
 impl Default for MotionTuning {
@@ -55,8 +70,32 @@ impl Default for MotionTuning {
             scale_gain: 0.014,
             focal_near_weight: default_focal_near_weight(),
             far_gain_factor: default_far_gain_factor(),
+            motion_saturation: default_motion_saturation(),
         }
     }
+}
+
+/// Squash an input tilt magnitude through a tanh-based saturation. Output is
+/// almost linear at small `mag` and asymptotes toward `1/k` as `mag → ∞`.
+/// At `k = 1.3`, `saturate_magnitude(1.0) ≈ 0.66` — i.e. full tilt yields
+/// about two-thirds of linear motion, while a quarter-tilt input is barely
+/// affected (`saturate_magnitude(0.25) ≈ 0.245`).
+pub fn saturate_magnitude(mag: f32, k: f32) -> f32 {
+    let m = mag.clamp(0.0, 1.0);
+    if k <= 1e-3 { m } else { (m * k).tanh() / k }
+}
+
+/// Apply tilt saturation to a 2D input direction, preserving direction and
+/// only shrinking magnitude. Returns the effective `(nx, ny)` for downstream
+/// transform/rotation math.
+pub fn saturated_tilt(nx: f32, ny: f32, tuning: &MotionTuning) -> (f32, f32) {
+    let raw_mag = nx.hypot(ny);
+    if raw_mag <= 1e-6 {
+        return (nx, ny);
+    }
+    let target_mag = saturate_magnitude(raw_mag, tuning.motion_saturation);
+    let ratio = target_mag / raw_mag;
+    (nx * ratio, ny * ratio)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,7 +114,8 @@ pub struct LayerTransform {
 }
 
 pub fn stage_rotation_deg(nx: f32, ny: f32, tilt_range_deg: f32, tuning: &MotionTuning) -> f32 {
-    nx * ny * tilt_range_deg * tuning.rotation_gain
+    let (nx_eff, ny_eff) = saturated_tilt(nx, ny, tuning);
+    nx_eff * ny_eff * tilt_range_deg * tuning.rotation_gain
 }
 
 pub fn layer_motion_for_weight(
@@ -135,11 +175,12 @@ pub fn compute_layer_transform(
     motion: &LayerMotion,
     tuning: &MotionTuning,
 ) -> LayerTransform {
-    let motion_mag = nx.hypot(ny).min(1.0);
+    let (nx_eff, ny_eff) = saturated_tilt(nx, ny, tuning);
+    let motion_mag = nx_eff.hypot(ny_eff).min(1.0);
     let travel =
         display_width.min(display_height) * (tuning.travel_base + parallax * tuning.travel_gain);
-    let tx_px = -nx * travel * motion.tx_weight * tuning.axis_gain_x;
-    let ty_px = ny * travel * motion.ty_weight * tuning.axis_gain_y;
+    let tx_px = -nx_eff * travel * motion.tx_weight * tuning.axis_gain_x;
+    let ty_px = ny_eff * travel * motion.ty_weight * tuning.axis_gain_y;
     let scale = 1.0 + motion_mag * (motion.scale_base + motion.scale_gain);
     LayerTransform {
         tx_px,
