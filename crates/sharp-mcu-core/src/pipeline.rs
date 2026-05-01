@@ -36,7 +36,12 @@ pub struct GenerateConfig {
 impl Default for GenerateConfig {
     fn default() -> Self {
         Self {
-            layer_count: 10,
+            // 16 bands (was 10): smaller per-band depth slices means less
+            // visible seam between adjacent layers when bipolar parallax
+            // pulls them apart. Combined with the wider feather in
+            // layer_alpha_for_depth, the band geometry blends into a
+            // continuous gradient rather than discrete steps.
+            layer_count: 16,
             preview_max_edge: 2560,
             preview_target_pixels: 2560 * 1440,
             disparity_factor: 1.0,
@@ -44,7 +49,7 @@ impl Default for GenerateConfig {
             debug_ply_decimation: 1.0,
             depth_fill_passes: 6,
             gamma: 1.55,
-            blur_backdrop_scale: 0.0045,
+            blur_backdrop_scale: 0.006,
             tilt_default_deg: 12.0,
             parallax_default: 0.10,
             emit_debug_ply: true,
@@ -151,6 +156,11 @@ pub fn generate_package(request: &GenerateRequest) -> Result<GenerateReport> {
         let band = depth_band_for_value(depth, &boundaries);
         band_map[idx] = band as u8;
     }
+    // Snapshot the raw (un-smoothed) band map for backdrop inpainting. The
+    // backdrop seeds need crisp foreground/background separation; the smoothed
+    // band map blurs depth boundaries, contaminating JFA seeds with silhouette
+    // pixels and reproducing foreground colors in the backdrop.
+    let raw_band_map = band_map.clone();
     smooth_band_map(
         &mut band_map,
         preview_size.width as usize,
@@ -161,9 +171,11 @@ pub fn generate_package(request: &GenerateRequest) -> Result<GenerateReport> {
         band_pixels[band as usize] += 1;
     }
 
-    let backdrop = build_ghost_reduced_backdrop(
+    let backdrop = build_inpainted_backdrop(
         &source_preview,
-        &band_map,
+        &raw_band_map,
+        preview_size.width as usize,
+        preview_size.height as usize,
         request.config.layer_count,
         request.config.blur_backdrop_scale,
     );
@@ -705,51 +717,210 @@ fn neighbor_indices(
     neighbors.into_iter().take(n)
 }
 
-fn build_ghost_reduced_backdrop(
+/// Build a content-aware backdrop: the parts of the image that belong to FAR
+/// bands are kept as-is, while NEAR (foreground) regions are inpainted with
+/// the spatially-nearest FAR pixel. The result is what should plausibly be
+/// "behind" the foreground, so that when a near layer translates during
+/// parallax, what gets revealed underneath is a reasonable continuation of
+/// the background (sky, wall, ground) rather than a blurry ghost of the
+/// foreground itself.
+///
+/// Uses Jump Flooding Algorithm (Rong & Tan 2006) to compute, for every
+/// foreground pixel, an approximation of its spatially-nearest background
+/// seed in O(N log max(W,H)) time. JFA is exact for most pixels and
+/// off-by-one in pathological cases; a final Gaussian blur hides any seam.
+fn build_inpainted_backdrop(
     source: &RgbaImage,
     band_map: &[u8],
+    width: usize,
+    height: usize,
     layer_count: usize,
     blur_scale: f32,
 ) -> RgbaImage {
-    let (width, height) = source.dimensions();
-    let sigma = (width.min(height) as f32 * blur_scale).max(2.0);
-    let blurred = imageops::blur(source, sigma);
-    let mut output = RgbaImage::new(width, height);
-    let denom = layer_count.saturating_sub(1).max(1) as f32;
-    for y in 0..height as i32 {
-        for x in 0..width as i32 {
-            let idx = y as usize * width as usize + x as usize;
-            let band = band_map[idx];
-            let near_weight = 1.0 - band as f32 / denom;
-            let mut max_band_delta = 0u8;
-            for oy in -1..=1 {
-                for ox in -1..=1 {
-                    if ox == 0 && oy == 0 {
-                        continue;
-                    }
-                    let sx = x + ox;
-                    let sy = y + oy;
-                    if sx < 0 || sy < 0 || sx >= width as i32 || sy >= height as i32 {
-                        continue;
-                    }
-                    let nidx = sy as usize * width as usize + sx as usize;
-                    max_band_delta = max_band_delta.max(band.abs_diff(band_map[nidx]));
+    let w = width as u32;
+    let h = height as u32;
+    let len = width * height;
+    if len == 0 {
+        return RgbaImage::new(w, h);
+    }
+    // Stricter seed threshold + aggressive erosion: only pixels that are
+    // genuinely deep inside the far-band region count as JFA seeds, never the
+    // silhouette ring (whose colors are a mix of foreground and background and
+    // would propagate "edge-of-foliage green" inward). The erode radius scales
+    // with the preview size — small previews can use radius 4, large ones 8+,
+    // because what matters is removing the sub-pixel-fuzzy depth silhouette.
+    let seed_band_threshold = ((layer_count as f32) * 0.62).round() as u8;
+    let seed_erode_radius =
+        ((width.min(height) as f32 * 0.008).round() as i32).clamp(3, 12);
+
+    let mut raw_seed = vec![false; len];
+    for idx in 0..len {
+        if band_map[idx] >= seed_band_threshold {
+            raw_seed[idx] = true;
+        }
+    }
+    // Erode by computing a horizontal-then-vertical min-pass on the raw mask.
+    // Equivalent to the brute-force 2D radius-R neighborhood test but O(N·R)
+    // instead of O(N·R²), which matters at radius ~10 on large previews.
+    let mut horiz = vec![false; len];
+    for y in 0..height {
+        for x in 0..width {
+            let mut all_far = true;
+            for ox in -seed_erode_radius..=seed_erode_radius {
+                let sx = x as i32 + ox;
+                if sx < 0 || sx >= width as i32 || !raw_seed[y * width + sx as usize] {
+                    all_far = false;
+                    break;
                 }
             }
-            let near_mix = smoothstep01((near_weight - 0.18) / 0.64);
-            let edge_mix = smoothstep01(max_band_delta as f32 / 2.0);
-            let blur_mix = (near_mix * (0.28 + edge_mix * 0.56)).clamp(0.0, 0.84);
-            let src = source.get_pixel(x as u32, y as u32).0;
-            let blur = blurred.get_pixel(x as u32, y as u32).0;
-            let inv = 1.0 - blur_mix;
+            horiz[y * width + x] = all_far;
+        }
+    }
+    let mut strict_seed = vec![false; len];
+    for y in 0..height {
+        for x in 0..width {
+            let mut all_far = true;
+            for oy in -seed_erode_radius..=seed_erode_radius {
+                let sy = y as i32 + oy;
+                if sy < 0 || sy >= height as i32 || !horiz[sy as usize * width + x] {
+                    all_far = false;
+                    break;
+                }
+            }
+            strict_seed[y * width + x] = all_far;
+        }
+    }
+    // Failsafe: if erosion removed everything (very foreground-heavy image),
+    // fall back to the un-eroded mask so we still have anchors for the JFA.
+    if !strict_seed.iter().any(|&v| v) {
+        strict_seed = raw_seed.clone();
+    }
+    const NONE: i32 = i32::MIN;
+    let mut buf_a: Vec<(i32, i32)> = vec![(NONE, NONE); len];
+    for idx in 0..len {
+        if strict_seed[idx] {
+            let x = (idx % width) as i32;
+            let y = (idx / width) as i32;
+            buf_a[idx] = (x, y);
+        }
+    }
+    let mut buf_b: Vec<(i32, i32)> = buf_a.clone();
+
+    let mut step = (width.max(height) / 2).max(1);
+    let mut read_from_a = true;
+    loop {
+        let (src_buf, dst_buf) = if read_from_a {
+            (&buf_a, &mut buf_b)
+        } else {
+            (&buf_b, &mut buf_a)
+        };
+        for y in 0..height as i32 {
+            for x in 0..width as i32 {
+                let here = (y as usize) * width + x as usize;
+                let mut best = src_buf[here];
+                let mut best_dist = if best.0 == NONE {
+                    i64::MAX
+                } else {
+                    let dx = (best.0 - x) as i64;
+                    let dy = (best.1 - y) as i64;
+                    dx * dx + dy * dy
+                };
+                let s = step as i32;
+                for oy in &[-s, 0, s] {
+                    for ox in &[-s, 0, s] {
+                        if *ox == 0 && *oy == 0 {
+                            continue;
+                        }
+                        let nx = x + *ox;
+                        let ny = y + *oy;
+                        if nx < 0 || ny < 0 || nx >= width as i32 || ny >= height as i32 {
+                            continue;
+                        }
+                        let candidate = src_buf[(ny as usize) * width + nx as usize];
+                        if candidate.0 == NONE {
+                            continue;
+                        }
+                        let dx = (candidate.0 - x) as i64;
+                        let dy = (candidate.1 - y) as i64;
+                        let d = dx * dx + dy * dy;
+                        if d < best_dist {
+                            best_dist = d;
+                            best = candidate;
+                        }
+                    }
+                }
+                dst_buf[here] = best;
+            }
+        }
+        read_from_a = !read_from_a;
+        if step == 1 {
+            break;
+        }
+        step /= 2;
+    }
+    let nearest = if read_from_a { &buf_a } else { &buf_b };
+
+    let mut filled = RgbaImage::new(w, h);
+    for y in 0..height as u32 {
+        for x in 0..width as u32 {
+            let here = (y as usize) * width + x as usize;
+            let (sx, sy) = nearest[here];
+            let pixel = if sx == NONE {
+                source.get_pixel(x, y).0
+            } else {
+                source.get_pixel(sx as u32, sy as u32).0
+            };
+            filled.put_pixel(x, y, Rgba(pixel));
+        }
+    }
+
+    // Hide JFA's Voronoi cells with a large-radius diffusion applied ONLY in
+    // the inpainted region. Genuine background pixels keep their original
+    // detail. The transition is feathered using each pixel's distance to its
+    // nearest seed (which JFA already gave us), so we don't get a hard
+    // boundary between sharp source and blurry fill.
+    let small_sigma = (w.min(h) as f32 * blur_scale).max(2.0);
+    let heavy_sigma = (w.min(h) as f32 * 0.04).max(small_sigma * 4.0);
+    let lightly_smoothed = imageops::blur(&filled, small_sigma);
+    let heavily_smoothed = imageops::blur(&filled, heavy_sigma);
+    // Feather radius (pixels): how far the seed→inpaint transition is spread.
+    // Bigger = softer seam, but also bleeds blur into background detail.
+    let feather_radius = ((w.min(h) as f32) * 0.012).max(6.0);
+    let feather_sq = feather_radius * feather_radius;
+    let mut output = RgbaImage::new(w, h);
+    for y in 0..height as u32 {
+        for x in 0..width as u32 {
+            let here = (y as usize) * width + x as usize;
+            let (sx, sy) = nearest[here];
+            // Distance from this pixel to its nearest strict seed (in px²).
+            let seed_dist_sq = if sx == NONE {
+                feather_sq * 4.0
+            } else {
+                let dx = sx as f32 - x as f32;
+                let dy = sy as f32 - y as f32;
+                dx * dx + dy * dy
+            };
+            // Inpaint-mix ramps from 0 at a strict seed pixel to 1 once we're
+            // a feather-radius away inside the foreground silhouette.
+            let inpaint_t = smoothstep01(seed_dist_sq / feather_sq);
+            // Source pixel for sharp content: at seeds we want the ORIGINAL
+            // image (filled[seed] == source[seed] anyway), and inside the
+            // silhouette we let the heavy blur dominate.
+            let sharp = if strict_seed[here] {
+                source.get_pixel(x, y).0
+            } else {
+                lightly_smoothed.get_pixel(x, y).0
+            };
+            let blurry = heavily_smoothed.get_pixel(x, y).0;
+            let inv = 1.0 - inpaint_t;
             output.put_pixel(
-                x as u32,
-                y as u32,
+                x,
+                y,
                 Rgba([
-                    (src[0] as f32 * inv + blur[0] as f32 * blur_mix).round() as u8,
-                    (src[1] as f32 * inv + blur[1] as f32 * blur_mix).round() as u8,
-                    (src[2] as f32 * inv + blur[2] as f32 * blur_mix).round() as u8,
-                    src[3],
+                    (sharp[0] as f32 * inv + blurry[0] as f32 * inpaint_t).round() as u8,
+                    (sharp[1] as f32 * inv + blurry[1] as f32 * inpaint_t).round() as u8,
+                    (sharp[2] as f32 * inv + blurry[2] as f32 * inpaint_t).round() as u8,
+                    sharp[3],
                 ]),
             );
         }
@@ -768,7 +939,11 @@ fn layer_alpha_for_depth(
     let band_span = (hi - lo).max(1e-5);
     let denom = boundaries.len().saturating_sub(2).max(1) as f32;
     let near_weight = 1.0 - band as f32 / denom;
-    let overlap = (total_span * 0.008).max(band_span * (0.18 + (1.0 - near_weight) * 0.14));
+    // Wider overlap (~0.5 of band_span) so adjacent layers significantly
+    // co-occupy each pixel near band borders. With bipolar parallax pulling
+    // layers apart, narrow overlap leaves visible seams; broad overlap turns
+    // discrete bands into a continuous depth gradient at compositing time.
+    let overlap = (total_span * 0.012).max(band_span * (0.50 + (1.0 - near_weight) * 0.20));
     let outer_lo = lo - overlap;
     let outer_hi = hi + overlap;
     if depth_value < outer_lo || depth_value > outer_hi {

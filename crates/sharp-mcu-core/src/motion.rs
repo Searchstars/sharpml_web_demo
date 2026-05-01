@@ -13,22 +13,48 @@ pub struct MotionTuning {
     pub layer_weight_power: f32,
     pub scale_base: f32,
     pub scale_gain: f32,
+    /// Normalized near_weight (0..1) of the depth that should stay still while
+    /// the camera tilts. Layers nearer than this slide with the gesture, layers
+    /// farther slide opposite. Acts as the focal/pivot plane.
+    #[serde(default = "default_focal_near_weight")]
+    pub focal_near_weight: f32,
+    /// Magnitude multiplier for the far (negative) side of the bipolar curve.
+    /// Real parallax shrinks at distance, so far layers usually move a bit less
+    /// than the symmetric near side.
+    #[serde(default = "default_far_gain_factor")]
+    pub far_gain_factor: f32,
+}
+
+fn default_focal_near_weight() -> f32 {
+    0.45
+}
+
+fn default_far_gain_factor() -> f32 {
+    0.8
 }
 
 impl Default for MotionTuning {
     fn default() -> Self {
         Self {
-            travel_base: 0.008,
-            travel_gain: 0.105,
+            // Bipolar weights span ~[-0.27, +0.34] (with the defaults below),
+            // about 3× the differential of the old single-sided 0.04..0.23
+            // curve, so we keep travel_base/gain modest — small parallax still
+            // produces a real depth-anchored shift.
+            travel_base: 0.010,
+            travel_gain: 0.135,
             rotation_gain: 0.24,
             axis_gain_x: 1.18,
             axis_gain_y: 0.94,
-            backdrop_weight: 0.018,
-            layer_weight_base: 0.04,
-            layer_weight_gain: 0.19,
-            layer_weight_power: 1.55,
+            // Backdrop is "the depth behind everything"; in bipolar parallax it
+            // slides opposite to near layers, like the deep wall in a diorama.
+            backdrop_weight: -0.20,
+            layer_weight_base: 0.0,
+            layer_weight_gain: 0.34,
+            layer_weight_power: 1.10,
             scale_base: 0.004,
-            scale_gain: 0.010,
+            scale_gain: 0.014,
+            focal_near_weight: default_focal_near_weight(),
+            far_gain_factor: default_far_gain_factor(),
         }
     }
 }
@@ -60,14 +86,37 @@ pub fn layer_motion_for_weight(
     let tx_weight = if is_backdrop {
         tuning.backdrop_weight
     } else {
-        tuning.layer_weight_base
-            + near_weight.powf(tuning.layer_weight_power) * tuning.layer_weight_gain
+        // Bipolar parallax: layers nearer than the focal plane slide WITH the
+        // tilt direction, layers farther slide AGAINST it. Pivoting around a
+        // mid-depth focal plane is what gives a real parallax sensation, vs.
+        // the previous unipolar curve where everything just slid together at
+        // different speeds.
+        let focal = tuning.focal_near_weight.clamp(1e-3, 1.0 - 1e-3);
+        let offset = near_weight - focal;
+        let normalized = if offset >= 0.0 {
+            // Near side: [focal, 1] → [0, 1]
+            offset / (1.0 - focal)
+        } else {
+            // Far side: [0, focal] → [-1, 0]
+            offset / focal
+        };
+        let mag = normalized.abs().powf(tuning.layer_weight_power);
+        let signed = mag.copysign(normalized);
+        let side_gain = if normalized >= 0.0 {
+            1.0
+        } else {
+            tuning.far_gain_factor
+        };
+        tuning.layer_weight_base + signed * side_gain * tuning.layer_weight_gain
     };
     let scale_base = if is_backdrop { 0.0 } else { tuning.scale_base };
     let scale_gain = if is_backdrop {
         0.0
     } else {
-        near_weight * tuning.scale_gain
+        // Symmetric scale boost — layers further from focal (in either
+        // direction) get a touch more "depth-zoom" with motion magnitude.
+        let dist = (near_weight - tuning.focal_near_weight).abs();
+        dist * tuning.scale_gain
     };
     LayerMotion {
         tx_weight,

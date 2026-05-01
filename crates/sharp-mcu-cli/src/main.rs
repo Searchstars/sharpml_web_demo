@@ -8,6 +8,10 @@ use sharp_mcu_core::{
     default_model_cache_dir, default_model_file, default_model_repo, generate_package,
 };
 
+fn default_layer_count() -> usize {
+    GenerateConfig::default().layer_count
+}
+
 #[derive(Parser)]
 #[command(name = "sharp-mcu")]
 #[command(about = "Rust SHARP preprocessing and MCU slice packaging")]
@@ -63,7 +67,7 @@ enum Command {
         model_file: String,
         #[arg(long, alias = "onnx-data-file")]
         model_data_file: Option<String>,
-        #[arg(long, alias = "layer-count", default_value_t = 10)]
+        #[arg(long, alias = "layer-count", default_value_t = default_layer_count())]
         layers: usize,
         #[arg(long, default_value_t = 2560)]
         preview_max_edge: u32,
